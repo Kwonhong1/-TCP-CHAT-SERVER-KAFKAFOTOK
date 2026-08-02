@@ -7,14 +7,17 @@
 #include <mutex>
 #include <memory>
 #include <cstring>
+#include <unordered_map>
+#include <atomic>
 
 using boost::asio::ip::tcp;
 
 // =========================================================
-// 서버와 동일하게 맞춘 프로토콜 정의
+// 프로토콜 정의 (LOGIN_PROMPT = 1000 추가)
 // =========================================================
 enum class MessageType : uint16_t
 {
+    LOGIN_PROMPT = 1000,
     LOGIN_REQUEST = 1001,
     LOGIN_RESPONSE = 1002,
     LOGOUT_REQUEST = 1003,
@@ -22,21 +25,18 @@ enum class MessageType : uint16_t
     CHAT_MESSAGE = 1005,
     JOIN_ROOM = 1006,
     LEAVE_ROOM = 1007,
-    ROOM_LIST_REQUEST = 1008,
-    ROOM_LIST_RESPONSE = 1009,
-    USER_LIST_REQUEST = 1010,
-    USER_LIST_RESPONSE = 1011,
-    PRIVATE_MESSAGE = 1012,
+    REGISTER_REQUEST = 1014,
+    REGISTER_RESPONSE = 1015,
     SERVER_NOTIFICATION = 1013
 };
 
 #pragma pack(push, 1)
 struct PacketHeader
 {
-    uint16_t packet_size;      // 전체 패킷 크기
-    MessageType message_type;  // 메시지 타입
-    uint32_t user_id;          // 발신자 ID
-    uint32_t sequence_number;  // 시퀀스 번호 (서버 헤더와 동기화)
+    uint16_t packet_size;
+    MessageType message_type;
+    uint32_t user_id;
+    uint32_t sequence_number;
 };
 
 struct LoginRequest
@@ -62,8 +62,45 @@ struct ChatMessage
 };
 #pragma pack(pop)
 
+class ChatClient;
+
 // =========================================================
-// 패킷 버퍼 클래스 (TCP 스트림 재조립)
+// 디스패처 인터페이스 & 클래스
+// =========================================================
+class IMessageHandler
+{
+public:
+    virtual ~IMessageHandler() = default;
+    virtual void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) = 0;
+};
+
+class MessageDispatcher
+{
+public:
+    void RegisterHandler(MessageType type, std::unique_ptr<IMessageHandler> handler)
+    {
+        handlers_[type] = std::move(handler);
+    }
+
+    void DispatchMessage(std::shared_ptr<ChatClient> client, const PacketHeader& header, const char* data, size_t size)
+    {
+        auto it = handlers_.find(header.message_type);
+        if (it != handlers_.end())
+        {
+            it->second->HandleMessage(client, data, size);
+        }
+        else
+        {
+            std::cout << "\n[System] Unhandled message type: " << static_cast<uint16_t>(header.message_type) << std::endl;
+        }
+    }
+
+private:
+    std::unordered_map<MessageType, std::unique_ptr<IMessageHandler>> handlers_;
+};
+
+// =========================================================
+// 패킷 버퍼
 // =========================================================
 class PacketBuffer
 {
@@ -72,16 +109,14 @@ public:
 
     bool HasCompletePacket() const
     {
-        if (GetReadableSize() < sizeof(PacketHeader))
-            return false;
+        if (GetReadableSize() < sizeof(PacketHeader)) return false;
         const PacketHeader* header = reinterpret_cast<const PacketHeader*>(buffer_.data() + read_pos_);
         return GetReadableSize() >= header->packet_size;
     }
 
     bool ReadPacket(std::vector<char>& packet_data)
     {
-        if (!HasCompletePacket())
-            return false;
+        if (!HasCompletePacket()) return false;
         const PacketHeader* header = reinterpret_cast<const PacketHeader*>(buffer_.data() + read_pos_);
         packet_data.resize(header->packet_size);
         std::memcpy(packet_data.data(), buffer_.data() + read_pos_, header->packet_size);
@@ -120,8 +155,7 @@ private:
 class ChatClient : public std::enable_shared_from_this<ChatClient>
 {
 public:
-    ChatClient(boost::asio::io_context& io_context)
-        : io_context_(io_context), socket_(io_context), read_buffer_(4096) {}
+    ChatClient(boost::asio::io_context& io_context);
 
     void Start(const std::string& host, const std::string& port)
     {
@@ -150,6 +184,8 @@ public:
 
     void SetUserId(uint32_t id) { user_id_ = id; }
     uint32_t GetUserId() const { return user_id_; }
+    void SetLoggedIn(bool status) { is_logged_in_ = status; }
+    bool IsLoggedIn() const { return is_logged_in_; }
 
 private:
     void DoConnect()
@@ -192,6 +228,7 @@ private:
                 {
                     std::cout << "\n[System] Disconnected from server." << std::endl;
                     is_connected_ = false;
+                    is_logged_in_ = false;
                     socket_.close();
                 }
             });
@@ -201,42 +238,7 @@ private:
     {
         if (size < sizeof(PacketHeader)) return;
         const auto& header = *reinterpret_cast<const PacketHeader*>(data);
-
-        switch (header.message_type)
-        {
-        case MessageType::LOGIN_RESPONSE:
-        {
-            if (size < sizeof(LoginResponse)) break;
-            const auto& res = *reinterpret_cast<const LoginResponse*>(data);
-            if (res.success)
-            {
-                user_id_ = res.assigned_user_id;
-                std::cout << "\n[System] Login Success! Assigned User ID: " << user_id_ << std::endl;
-            }
-            else
-            {
-                std::cout << "\n[System] Login Failed: " << res.error_message << std::endl;
-            }
-            break;
-        }
-        case MessageType::CHAT_MESSAGE:
-        {
-            if (size < sizeof(ChatMessage)) break;
-            const auto& msg = *reinterpret_cast<const ChatMessage*>(data);
-            std::cout << "\n[User " << msg.header.user_id << "]: " << msg.message << std::endl;
-            break;
-        }
-        case MessageType::SERVER_NOTIFICATION:
-        {
-            std::string notice(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
-            std::cout << "\n[Notification] " << notice << std::endl;
-            break;
-        }
-        default:
-            std::cout << "\n[System] Unhandled packet type: " << static_cast<uint16_t>(header.message_type) << std::endl;
-            break;
-        }
-        std::cout << "Message: " << std::flush;
+        dispatcher_.DispatchMessage(shared_from_this(), header, data, size);
     }
 
     void DoWrite()
@@ -263,15 +265,86 @@ private:
     tcp::socket socket_;
     tcp::resolver::results_type endpoints_;
     bool is_connected_{false};
+    std::atomic<bool> is_logged_in_{false};
     uint32_t user_id_{0};
 
+    MessageDispatcher dispatcher_;
     PacketBuffer packet_buffer_;
     std::vector<char> read_buffer_;
     std::queue<std::vector<char>> write_queue_;
 };
 
 // =========================================================
-// main()
+// 클라이언트 핸들러 구현부
+// =========================================================
+class LoginPromptHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        std::cout << "[Server] Please log in to proceed." << std::endl;
+    }
+};
+
+class LoginResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(LoginResponse)) return;
+        const auto& res = *reinterpret_cast<const LoginResponse*>(data);
+
+        if (res.success)
+        {
+            client->SetUserId(res.assigned_user_id);
+            client->SetLoggedIn(true);
+            std::cout << "\n[System] Login Success! Assigned User ID: " << res.assigned_user_id << std::endl;
+            std::cout << "Message: " << std::flush;
+        }
+        else
+        {
+            std::cout << "\n[System] Login Failed: " << res.error_message << std::endl;
+        }
+    }
+};
+
+class ChatMessageHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(ChatMessage)) return;
+        const auto& msg = *reinterpret_cast<const ChatMessage*>(data);
+        std::cout << "\n[User " << msg.header.user_id << "]: " << msg.message << std::endl;
+        std::cout << "Message: " << std::flush;
+    }
+};
+
+class ServerNotificationHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        std::string notice(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
+        std::cout << "\n[Notification] " << notice << std::endl;
+        std::cout << "Message: " << std::flush;
+    }
+};
+
+// =========================================================
+// ChatClient 생성자 (핸들러 바인딩)
+// =========================================================
+ChatClient::ChatClient(boost::asio::io_context& io_context)
+    : io_context_(io_context), socket_(io_context), read_buffer_(4096)
+{
+    dispatcher_.RegisterHandler(MessageType::LOGIN_PROMPT, std::make_unique<LoginPromptHandler>());
+    dispatcher_.RegisterHandler(MessageType::LOGIN_RESPONSE, std::make_unique<LoginResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>());
+    dispatcher_.RegisterHandler(MessageType::SERVER_NOTIFICATION, std::make_unique<ServerNotificationHandler>());
+}
+
+// =========================================================
+// main() - 동기화 제어 추가
 // =========================================================
 int main()
 {
@@ -282,7 +355,7 @@ int main()
 
     std::thread t([&io_context]() { io_context.run(); });
 
-    // 1. 로그인 요청 패킷 전송
+    // 1. 로그인 요청 전송
     LoginRequest req{};
     req.header.packet_size = sizeof(LoginRequest);
     req.header.message_type = MessageType::LOGIN_REQUEST;
@@ -293,7 +366,14 @@ int main()
 
     client->Send(&req, sizeof(LoginRequest));
 
-    // 2. 채팅 메시지 입력 루프
+    // 2. 로그인 완료까지 대기 (간단한 동기화)
+    std::cout << "[System] Waiting for login response..." << std::endl;
+    while (!client->IsLoggedIn())
+    {
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+
+    // 3. 로그인 성공 후에만 채팅 입력 루프 실행
     std::string line;
     while (std::getline(std::cin, line))
     {
@@ -302,9 +382,9 @@ int main()
         ChatMessage msg{};
         msg.header.packet_size = sizeof(ChatMessage);
         msg.header.message_type = MessageType::CHAT_MESSAGE;
-        msg.header.user_id = client->GetUserId(); // 로그인 후 부여받은 ID 사용
+        msg.header.user_id = client->GetUserId();
         msg.header.sequence_number = 1;
-        msg.room_id = 1; // 서버의 기본 로비 방 ID
+        msg.room_id = 1;
         std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
 
         client->Send(&msg, sizeof(ChatMessage));
