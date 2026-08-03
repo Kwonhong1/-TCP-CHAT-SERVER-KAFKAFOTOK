@@ -452,6 +452,38 @@ public:
         });
     }
 
+
+    template <typename Callback>
+    void CreateRoom(const std::string& name, uint32_t max_users, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), name, max_users, cb = std::forward<Callback>(callback)]() mutable {
+            uint32_t new_room_id = next_room_id_++;
+            auto new_room = std::make_shared<ChatRoom>(io_context_, new_room_id, name, max_users);
+            rooms_[new_room_id] = new_room;
+            
+            std::cout << "[Server] Room Created: " << name << " (ID: " << new_room_id << ")" << std::endl;
+            cb(new_room_id);
+        });
+    }
+    // 전체 방 목록 수집
+    template <typename Callback>
+    void GetRoomList(Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), cb = std::forward<Callback>(callback)]() mutable {
+            std::vector<RoomInfo> room_list;
+            for (const auto& [id, room] : rooms_)
+            {
+                RoomInfo info{};
+                info.room_id = room->GetId();
+                std::strncpy(info.room_name, room->GetName().c_str(), sizeof(info.room_name) - 1);
+                info.current_users = room->GetCurrentUsers();
+                info.max_users = room->GetMaxUsers();
+                room_list.push_back(info);
+            }
+            cb(room_list);
+        });
+    }
+
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
     UserManager& GetUserManager() { return *user_manager_; }
 
@@ -521,6 +553,63 @@ void ChatSession::ProcessPacket(const char* data, size_t size)
 //=====================
 // 메시지 핸들러 구현부 (비동기 콜백 적용)
 //=====================
+// 1. 방 생성 핸들러
+class CreateRoomHandler : public IMessageHandler
+{
+public:
+    explicit CreateRoomHandler(ChatServer& server) : server_(server) {}
+
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(CreateRoomRequest)) return;
+        const auto& req = *reinterpret_cast<const CreateRoomRequest*>(data);
+
+        std::string room_name = req.room_name;
+        uint32_t max_users = req.max_users;
+
+        server_.CreateRoom(room_name, max_users, [session](uint32_t created_room_id) {
+            CreateRoomResponse res{};
+            res.header.message_type = MessageType::CREATE_ROOM_RESPONSE;
+            res.header.packet_size = sizeof(CreateRoomResponse);
+            res.success = true;
+            res.created_room_id = created_room_id;
+
+            session->SendMessage(&res, sizeof(CreateRoomResponse));
+        });
+    }
+
+private:
+    ChatServer& server_;
+};
+
+// 2. 방 목록 조회 핸들러
+class RoomListHandler : public IMessageHandler
+{
+public:
+    explicit RoomListHandler(ChatServer& server) : server_(server) {}
+
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(RoomListRequest)) return;
+
+        server_.GetRoomList([session](const std::vector<RoomInfo>& list) {
+            RoomListResponse res{};
+            res.header.message_type = MessageType::ROOM_LIST_RESPONSE;
+            res.header.packet_size = sizeof(RoomListResponse);
+            res.room_count = static_cast<uint32_t>(std::min(list.size(), size_t(16)));
+
+            for (size_t i = 0; i < res.room_count; ++i)
+            {
+                res.rooms[i] = list[i];
+            }
+
+            session->SendMessage(&res, sizeof(RoomListResponse));
+        });
+    }
+
+private:
+    ChatServer& server_;
+};
 class LoginHandler : public IMessageHandler
 {
 public:
