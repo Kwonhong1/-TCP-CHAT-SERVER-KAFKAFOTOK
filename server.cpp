@@ -351,9 +351,11 @@ public:
 
     bool AddUser(std::shared_ptr<User> user)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return false;
-        users_[user->GetId()] = user;
+        {
+            std::lock_guard<std::mutex> lock(users_mutex_);
+            if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return false;
+            users_[user->GetId()] = user;
+        }
         BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
         return true;
     }

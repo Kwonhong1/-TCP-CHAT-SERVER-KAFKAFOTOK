@@ -9,11 +9,12 @@
 #include <cstring>
 #include <unordered_map>
 #include <atomic>
+#include <chrono>
 
 using boost::asio::ip::tcp;
 
 // =========================================================
-// 프로토콜 정의 (LOGIN_PROMPT = 1000 추가)
+// 프로토콜 정의
 // =========================================================
 enum class MessageType : uint16_t
 {
@@ -28,6 +29,14 @@ enum class MessageType : uint16_t
     REGISTER_REQUEST = 1014,
     REGISTER_RESPONSE = 1015,
     SERVER_NOTIFICATION = 1013
+};
+
+enum class AuthStatus
+{
+    NONE,
+    WAITING,
+    SUCCESS,
+    FAILED
 };
 
 #pragma pack(push, 1)
@@ -47,6 +56,21 @@ struct LoginRequest
 };
 
 struct LoginResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t assigned_user_id;
+    char error_message[128];
+};
+
+struct RegisterRequest
+{
+    PacketHeader header;
+    char username[32];
+    char password[64];
+};
+
+struct RegisterResponse
 {
     PacketHeader header;
     bool success;
@@ -184,8 +208,11 @@ public:
 
     void SetUserId(uint32_t id) { user_id_ = id; }
     uint32_t GetUserId() const { return user_id_; }
-    void SetLoggedIn(bool status) { is_logged_in_ = status; }
-    bool IsLoggedIn() const { return is_logged_in_; }
+    void SetAuthStatus(AuthStatus status) { auth_status_ = status; }
+    AuthStatus GetAuthStatus() const { return auth_status_; }
+
+    bool IsConnected() const { return is_connected_; }
+    bool IsConnectFailed() const { return connect_failed_; }
 
 private:
     void DoConnect()
@@ -206,6 +233,7 @@ private:
                 else
                 {
                     std::cout << "[System] Connect failed: " << ec.message() << std::endl;
+                    connect_failed_ = true;
                 }
             });
     }
@@ -228,7 +256,7 @@ private:
                 {
                     std::cout << "\n[System] Disconnected from server." << std::endl;
                     is_connected_ = false;
-                    is_logged_in_ = false;
+                    auth_status_ = AuthStatus::FAILED;
                     socket_.close();
                 }
             });
@@ -264,8 +292,9 @@ private:
     boost::asio::io_context& io_context_;
     tcp::socket socket_;
     tcp::resolver::results_type endpoints_;
-    bool is_connected_{false};
-    std::atomic<bool> is_logged_in_{false};
+    std::atomic<bool> is_connected_{false};
+    std::atomic<bool> connect_failed_{false};
+    std::atomic<AuthStatus> auth_status_{AuthStatus::NONE};
     uint32_t user_id_{0};
 
     MessageDispatcher dispatcher_;
@@ -282,7 +311,7 @@ class LoginPromptHandler : public IMessageHandler
 public:
     void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
     {
-        std::cout << "[Server] Please log in to proceed." << std::endl;
+        std::cout << "[Server] Welcome! Please register or log in." << std::endl;
     }
 };
 
@@ -297,13 +326,34 @@ public:
         if (res.success)
         {
             client->SetUserId(res.assigned_user_id);
-            client->SetLoggedIn(true);
-            std::cout << "\n[System] Login Success! Assigned User ID: " << res.assigned_user_id << std::endl;
-            std::cout << "Message: " << std::flush;
+            client->SetAuthStatus(AuthStatus::SUCCESS);
+            std::cout << "\n[System] Login Success! User ID: " << res.assigned_user_id << std::endl;
         }
         else
         {
+            client->SetAuthStatus(AuthStatus::FAILED);
             std::cout << "\n[System] Login Failed: " << res.error_message << std::endl;
+        }
+    }
+};
+
+class RegisterResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(RegisterResponse)) return;
+        const auto& res = *reinterpret_cast<const RegisterResponse*>(data);
+
+        if (res.success)
+        {
+            client->SetAuthStatus(AuthStatus::NONE);
+            std::cout << "\n[System] Registration Success! User ID: " << res.assigned_user_id << ". Please Log In." << std::endl;
+        }
+        else
+        {
+            client->SetAuthStatus(AuthStatus::FAILED);
+            std::cout << "\n[System] Registration Failed: " << res.error_message << std::endl;
         }
     }
 };
@@ -339,43 +389,103 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_PROMPT, std::make_unique<LoginPromptHandler>());
     dispatcher_.RegisterHandler(MessageType::LOGIN_RESPONSE, std::make_unique<LoginResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::REGISTER_RESPONSE, std::make_unique<RegisterResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>());
     dispatcher_.RegisterHandler(MessageType::SERVER_NOTIFICATION, std::make_unique<ServerNotificationHandler>());
 }
 
 // =========================================================
-// main() - 동기화 제어 추가
+// main() - CLI 메뉴 및 동기화 제어
 // =========================================================
 int main()
 {
     boost::asio::io_context io_context;
 
     auto client = std::make_shared<ChatClient>(io_context);
+    
+    std::cout << "[System] Connecting to server..." << std::endl;
     client->Start("127.0.0.1", "8080");
 
     std::thread t([&io_context]() { io_context.run(); });
 
-    // 1. 로그인 요청 전송
-    LoginRequest req{};
-    req.header.packet_size = sizeof(LoginRequest);
-    req.header.message_type = MessageType::LOGIN_REQUEST;
-    req.header.user_id = 0;
-    req.header.sequence_number = 1;
-    std::strncpy(req.username, "testuser", sizeof(req.username) - 1);
-    std::strncpy(req.password, "1234", sizeof(req.password) - 1);
-
-    client->Send(&req, sizeof(LoginRequest));
-
-    // 2. 로그인 완료까지 대기 (간단한 동기화)
-    std::cout << "[System] Waiting for login response..." << std::endl;
-    while (!client->IsLoggedIn())
+    // 1. 소켓 연결이 완료될 때까지 대기
+    while (!client->IsConnected() && !client->IsConnectFailed())
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
 
-    // 3. 로그인 성공 후에만 채팅 입력 루프 실행
+    if (client->IsConnectFailed())
+    {
+        std::cout << "[System] Exiting due to connection failure." << std::endl;
+        io_context.stop();
+        if (t.joinable()) t.join();
+        return 0;
+    }
+
+    // 2. 연결 완료 후 LOGIN_PROMPT 수신 시간을 위한 짧은 유예 시간
+    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+
+    // 3. 로그인 완료될 때까지 메뉴 루프 실행
+    while (client->GetAuthStatus() != AuthStatus::SUCCESS)
+    {
+        std::cout << "\n=========================" << std::endl;
+        std::cout << " 1. Register (회원가입)" << std::endl;
+        std::cout << " 2. Login (로그인)" << std::endl;
+        std::cout << " 3. Exit (종료)" << std::endl;
+        std::cout << "Select Menu: ";
+
+        int choice = 0;
+        if (!(std::cin >> choice)) break;
+
+        if (choice == 3)
+        {
+            io_context.stop();
+            if (t.joinable()) t.join();
+            return 0;
+        }
+
+        std::string username, password;
+        std::cout << "Username: ";
+        std::cin >> username;
+        std::cout << "Password: ";
+        std::cin >> password;
+
+        if (choice == 1) // 회원가입
+        {
+            RegisterRequest req{};
+            req.header.packet_size = sizeof(RegisterRequest);
+            req.header.message_type = MessageType::REGISTER_REQUEST;
+            std::strncpy(req.username, username.c_str(), sizeof(req.username) - 1);
+            std::strncpy(req.password, password.c_str(), sizeof(req.password) - 1);
+
+            client->SetAuthStatus(AuthStatus::WAITING);
+            client->Send(&req, sizeof(RegisterRequest));
+        }
+        else if (choice == 2) // 로그인
+        {
+            LoginRequest req{};
+            req.header.packet_size = sizeof(LoginRequest);
+            req.header.message_type = MessageType::LOGIN_REQUEST;
+            std::strncpy(req.username, username.c_str(), sizeof(req.username) - 1);
+            std::strncpy(req.password, password.c_str(), sizeof(req.password) - 1);
+
+            client->SetAuthStatus(AuthStatus::WAITING);
+            client->Send(&req, sizeof(LoginRequest));
+        }
+
+        // 서버 응답 패킷 올 때까지 대기
+        while (client->GetAuthStatus() == AuthStatus::WAITING)
+        {
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
+        }
+    }
+
+    // 4. 로그인 성공 후 채팅 입력 루프 시작
+    std::cout << "\n--- Entered Chat Room (Lobby) ---" << std::endl;
     std::string line;
-    while (std::getline(std::cin, line))
+    std::cin.ignore(); // 입력 버퍼 잔여 줄바꿈 제거
+
+    while (std::cout << "Message: " && std::getline(std::cin, line))
     {
         if (line == "exit") break;
 
@@ -383,7 +493,6 @@ int main()
         msg.header.packet_size = sizeof(ChatMessage);
         msg.header.message_type = MessageType::CHAT_MESSAGE;
         msg.header.user_id = client->GetUserId();
-        msg.header.sequence_number = 1;
         msg.room_id = 1;
         std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
 
