@@ -518,6 +518,8 @@ private:
     MessageDispatcher dispatcher_;
     std::shared_ptr<UserManager> user_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
+
+    
 };
 
 void ChatSession::Start()
@@ -740,6 +742,9 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_));
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>(*this));
+
+    dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_REQUEST, std::make_unique<CreateRoomHandler>(*this));
+    dispatcher_.RegisterHandler(MessageType::ROOM_LIST_REQUEST, std::make_unique<RoomListHandler>(*this));
     do_accept();
 }
 
