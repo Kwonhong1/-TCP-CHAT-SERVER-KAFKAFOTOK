@@ -5,8 +5,6 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
-#include <mutex>
-#include <atomic>
 #include <queue>
 #include <cstring>
 
@@ -80,7 +78,7 @@ class ChatRoom;
 class ChatSession;
 
 //=====================
-// 유저 및 관리자
+// 유저 및 관리자 (Strand 적용)
 //=====================
 class User
 {
@@ -105,45 +103,58 @@ private:
     std::weak_ptr<ChatSession> session_;
 };
 
-class UserManager
+class UserManager : public std::enable_shared_from_this<UserManager>
 {
 public:
-    UserManager() : next_user_id_(1) {}
+    explicit UserManager(boost::asio::io_context& io_context)
+        : strand_(boost::asio::make_strand(io_context)), next_user_id_(1) {}
 
-    std::shared_ptr<User> CreateUser(const std::string& username, uint64_t password)
+    template <typename Callback>
+    void CreateUser(const std::string& username, uint64_t password, Callback&& callback)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        for (const auto& [id, user] : users_) {
-            if (user->GetUsername() == username) return nullptr;
-        }
-        uint32_t user_id = next_user_id_++;
-        auto user = std::make_shared<User>(user_id, username);
-        user->SetPassword(password);
-        users_[user_id] = user;
-        std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
-        return user;
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, password, cb = std::forward<Callback>(callback)]() mutable {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    cb(nullptr);
+                    return;
+                }
+            }
+            uint32_t user_id = next_user_id_++;
+            auto user = std::make_shared<User>(user_id, username);
+            user->SetPassword(password);
+            users_[user_id] = user;
+            std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
+            cb(user);
+        });
     }
 
-    std::shared_ptr<User> GetUserByUsername(const std::string& username)
+    template <typename Callback>
+    void GetUserByUsername(const std::string& username, Callback&& callback)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        for (const auto& [id, user] : users_) {
-            if (user->GetUsername() == username) return user;
-        }
-        return nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, cb = std::forward<Callback>(callback)]() mutable {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    cb(user);
+                    return;
+                }
+            }
+            cb(nullptr);
+        });
     }
 
-    std::shared_ptr<User> GetUser(uint32_t user_id)
+    template <typename Callback>
+    void GetUser(uint32_t user_id, Callback&& callback)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        auto it = users_.find(user_id);
-        return (it != users_.end()) ? it->second : nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
+            auto it = users_.find(user_id);
+            cb((it != users_.end()) ? it->second : nullptr);
+        });
     }
 
 private:
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
-    mutable std::mutex users_mutex_;
-    std::atomic<uint32_t> next_user_id_;
+    uint32_t next_user_id_;
 };
 
 //=====================
@@ -232,13 +243,14 @@ private:
 };
 
 //=====================
-// 세션 클래스
+// 세션 클래스 (Strand 적용)
 //=====================
 class ChatSession : public std::enable_shared_from_this<ChatSession>
 {
 public:
     ChatSession(tcp::socket socket, ChatServer& server)
-        : socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false) {}
+        : strand_(boost::asio::make_strand(socket.get_executor())),
+          socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false) {}
 
     ~ChatSession()
     {
@@ -250,21 +262,19 @@ public:
 
     void SendMessage(const void* data, size_t size)
     {
-        if (is_disconnected_.load()) return;
+        if (is_disconnected_) return;
 
         std::vector<char> message(static_cast<const char*>(data), static_cast<const char*>(data) + size);
-        bool write_in_progress = false;
 
-        {
-            std::lock_guard<std::mutex> lock(write_mutex_);
-            write_in_progress = !write_queue_.empty();
-            write_queue_.push(std::move(message));
-        }
+        boost::asio::post(strand_, [this, self = shared_from_this(), msg = std::move(message)]() mutable {
+            bool write_in_progress = !write_queue_.empty();
+            write_queue_.push(std::move(msg));
 
-        if (!write_in_progress)
-        {
-            Do_write();
-        }
+            if (!write_in_progress)
+            {
+                Do_write();
+            }
+        });
     }
 
     void SetUserId(uint32_t id) { user_id_ = id; }
@@ -279,7 +289,7 @@ private:
     {
         auto self = shared_from_this();
         socket_.async_read_some(boost::asio::buffer(read_buffer_),
-            [this, self](boost::system::error_code ec, std::size_t length) {
+            boost::asio::bind_executor(strand_, [this, self](boost::system::error_code ec, std::size_t length) {
                 if (!ec)
                 {
                     packet_buffer_.WriteData(read_buffer_.data(), length);
@@ -294,47 +304,38 @@ private:
                 {
                     Disconnect();
                 }
-            });
+            }));
     }
 
     void Do_write()
     {
         auto self = shared_from_this();
-        std::vector<char> message;
+        if (write_queue_.empty()) return;
 
-        {
-            std::lock_guard<std::mutex> lock(write_mutex_);
-            if (write_queue_.empty()) return;
-            message = write_queue_.front();
-        }
+        const auto& message = write_queue_.front();
 
         boost::asio::async_write(socket_, boost::asio::buffer(message.data(), message.size()),
-            [this, self](boost::system::error_code ec, std::size_t) {
+            boost::asio::bind_executor(strand_, [this, self](boost::system::error_code ec, std::size_t) {
                 if (!ec)
                 {
-                    bool has_more = false;
-                    {
-                        std::lock_guard<std::mutex> lock(write_mutex_);
-                        write_queue_.pop();
-                        has_more = !write_queue_.empty();
-                    }
-                    if (has_more) Do_write();
+                    write_queue_.pop();
+                    if (!write_queue_.empty()) Do_write();
                 }
                 else
                 {
                     Disconnect();
                 }
-            });
+            }));
     }
 
     void ProcessPacket(const char* data, size_t size);
 
+    boost::asio::strand<boost::asio::any_io_executor> strand_;
     tcp::socket socket_;
     ChatServer& server_;
     uint32_t user_id_;
-    std::atomic<bool> is_authenticated_;
-    std::atomic<bool> is_disconnected_;
-    std::mutex write_mutex_;
+    bool is_authenticated_;
+    bool is_disconnected_;
 
     std::queue<std::vector<char>> write_queue_;
     std::vector<char> read_buffer_ = std::vector<char>(4096);
@@ -342,46 +343,47 @@ private:
 };
 
 //=====================
-// 채팅방
+// 채팅방 (Strand 적용)
 //=====================
-class ChatRoom
+class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
 public:
-    ChatRoom(std::string name, uint32_t max_users) : name_(name), max_users_(max_users) {}
+    ChatRoom(boost::asio::io_context& io_context, std::string name, uint32_t max_users)
+        : strand_(boost::asio::make_strand(io_context)), name_(name), max_users_(max_users) {}
 
-    bool AddUser(std::shared_ptr<User> user)
+    void AddUser(std::shared_ptr<User> user)
     {
-        {
-            std::lock_guard<std::mutex> lock(users_mutex_);
-            if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return false;
+        boost::asio::post(strand_, [this, self = shared_from_this(), user]() {
+            if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return;
             users_[user->GetId()] = user;
-        }
-        BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
-        return true;
+            BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+        });
     }
 
-    bool RemoveUser(uint32_t user_id)
+    void RemoveUser(uint32_t user_id)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        auto it = users_.find(user_id);
-        if (it == users_.end()) return false;
-        std::string username = it->second->GetUsername();
-        users_.erase(it);
-        BroadcastNotification(username + " left the room.", user_id);
-        return true;
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id]() {
+            auto it = users_.find(user_id);
+            if (it == users_.end()) return;
+            std::string username = it->second->GetUsername();
+            users_.erase(it);
+            BroadcastNotification(username + " left the room.", user_id);
+        });
     }
 
     void BroadcastMessage(const ChatMessage& message, uint32_t sender_id)
     {
-        std::lock_guard<std::mutex> lock(users_mutex_);
-        for (const auto& [id, user] : users_)
-        {
-            if (id == sender_id) continue;
-            auto session = user->GetSession().lock();
-            if (session) session->SendMessage(&message, sizeof(ChatMessage));
-        }
+        boost::asio::post(strand_, [this, self = shared_from_this(), message, sender_id]() {
+            for (const auto& [id, user] : users_)
+            {
+                if (id == sender_id) continue;
+                auto session = user->GetSession().lock();
+                if (session) session->SendMessage(&message, sizeof(ChatMessage));
+            }
+        });
     }
 
+private:
     void BroadcastNotification(const std::string& notification, uint32_t exclude_user_id)
     {
         PacketHeader header{};
@@ -392,7 +394,6 @@ public:
         std::memcpy(packet.data(), &header, sizeof(PacketHeader));
         std::memcpy(packet.data() + sizeof(PacketHeader), notification.c_str(), notification.size());
 
-        std::lock_guard<std::mutex> lock(users_mutex_);
         for (const auto& [id, user] : users_)
         {
             if (id == exclude_user_id) continue;
@@ -401,17 +402,16 @@ public:
         }
     }
 
-private:
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::string name_;
     uint32_t max_users_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
-    mutable std::mutex users_mutex_;
 };
 
 //=====================
-// 서버 클래스
+// 서버 클래스 (Strand 적용)
 //=====================
-class ChatServer
+class ChatServer : public std::enable_shared_from_this<ChatServer>
 {
 public:
     ChatServer(boost::asio::io_context& io_context, short port);
@@ -419,30 +419,35 @@ public:
     void OnSessionDisconnected(std::shared_ptr<ChatSession> session)
     {
         uint32_t user_id = session->GetUserId();
-        auto user = user_manager_.GetUser(user_id);
-        if (user)
-        {
-            user->SetOnline(false);
-            std::lock_guard<std::mutex> lock(rooms_mutex_);
-            for (auto& [id, room] : rooms_) room->RemoveUser(user_id);
-            std::cout << "[System] User disconnected: " << user->GetUsername() << std::endl;
-        }
+        user_manager_->GetUser(user_id, [this, self = shared_from_this(), user_id](std::shared_ptr<User> user) {
+            if (user)
+            {
+                user->SetOnline(false);
+                boost::asio::post(strand_, [this, self, user_id]() {
+                    for (auto& [id, room] : rooms_) room->RemoveUser(user_id);
+                    std::cout << "[System] User disconnected ID: " << user_id << std::endl;
+                });
+            }
+        });
     }
 
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
-    UserManager& GetUserManager() { return user_manager_; }
+    UserManager& GetUserManager() { return *user_manager_; }
 
     void CreateRoom(uint32_t room_id, const std::string& name, uint32_t max_users)
     {
-        std::lock_guard<std::mutex> lock(rooms_mutex_);
-        rooms_[room_id] = std::make_shared<ChatRoom>(name, max_users);
+        boost::asio::post(strand_, [this, self = shared_from_this(), room_id, name, max_users]() {
+            rooms_[room_id] = std::make_shared<ChatRoom>(io_context_, name, max_users);
+        });
     }
 
-    std::shared_ptr<ChatRoom> GetRoom(uint32_t room_id)
+    template <typename Callback>
+    void GetRoom(uint32_t room_id, Callback&& callback)
     {
-        std::lock_guard<std::mutex> lock(rooms_mutex_);
-        auto it = rooms_.find(room_id);
-        return (it != rooms_.end()) ? it->second : nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), room_id, cb = std::forward<Callback>(callback)]() mutable {
+            auto it = rooms_.find(room_id);
+            cb((it != rooms_.end()) ? it->second : nullptr);
+        });
     }
 
 private:
@@ -454,11 +459,12 @@ private:
         });
     }
 
+    boost::asio::io_context& io_context_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     tcp::acceptor acceptor_;
     MessageDispatcher dispatcher_;
-    UserManager user_manager_;
+    std::shared_ptr<UserManager> user_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
-    std::mutex rooms_mutex_;
 };
 
 void ChatSession::Start()
@@ -476,7 +482,9 @@ void ChatSession::Start()
 
 void ChatSession::Disconnect()
 {
-    if (is_disconnected_.exchange(true)) return;
+    if (is_disconnected_) return;
+    is_disconnected_ = true;
+
     boost::system::error_code ec;
     socket_.close(ec);
     server_.OnSessionDisconnected(shared_from_this());
@@ -490,7 +498,7 @@ void ChatSession::ProcessPacket(const char* data, size_t size)
 }
 
 //=====================
-// 메시지 핸들러 구현부
+// 메시지 핸들러 구현부 (비동기 콜백 적용)
 //=====================
 class LoginHandler : public IMessageHandler
 {
@@ -503,44 +511,45 @@ public:
         if (size < sizeof(LoginRequest)) return;
         const auto& request = *reinterpret_cast<const LoginRequest*>(data);
 
-        LoginResponse response{};
-        response.header.message_type = MessageType::LOGIN_RESPONSE;
-        response.header.packet_size = sizeof(LoginResponse);
-
         std::string username = request.username;
         uint64_t pass = 0;
         try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
 
-        auto existing_user = user_manager_.GetUserByUsername(username);
+        user_manager_.GetUserByUsername(username, [session, pass, username, &server = server_](std::shared_ptr<User> existing_user) {
+            LoginResponse response{};
+            response.header.message_type = MessageType::LOGIN_RESPONSE;
+            response.header.packet_size = sizeof(LoginResponse);
 
-        if (!existing_user)
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
-            std::cout << "[Login Fail] User not found: " << username << std::endl;
-        }
-        else if (existing_user->GetPassword() == pass)
-        {
-            existing_user->SetSession(session);
-            existing_user->SetOnline(true);
-            session->SetUserId(existing_user->GetId());
-            session->SetAuthenticated(true);
+            if (!existing_user)
+            {
+                response.success = false;
+                std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
+                std::cout << "[Login Fail] User not found: " << username << std::endl;
+            }
+            else if (existing_user->GetPassword() == pass)
+            {
+                existing_user->SetSession(session);
+                existing_user->SetOnline(true);
+                session->SetUserId(existing_user->GetId());
+                session->SetAuthenticated(true);
 
-            response.success = true;
-            response.assigned_user_id = existing_user->GetId();
-            std::cout << "[Login Success] User: " << username << " (ID: " << existing_user->GetId() << ")" << std::endl;
+                response.success = true;
+                response.assigned_user_id = existing_user->GetId();
+                std::cout << "[Login Success] User: " << username << " (ID: " << existing_user->GetId() << ")" << std::endl;
 
-            auto lobby = server_.GetRoom(1);
-            if (lobby) lobby->AddUser(existing_user);
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
-            std::cout << "[Login Fail] Incorrect password for: " << username << std::endl;
-        }
+                server.GetRoom(1, [existing_user](std::shared_ptr<ChatRoom> lobby) {
+                    if (lobby) lobby->AddUser(existing_user);
+                });
+            }
+            else
+            {
+                response.success = false;
+                std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
+                std::cout << "[Login Fail] Incorrect password for: " << username << std::endl;
+            }
 
-        session->SendMessage(&response, sizeof(LoginResponse));
+            session->SendMessage(&response, sizeof(LoginResponse));
+        });
     }
 
 private:
@@ -558,28 +567,29 @@ public:
         if (size < sizeof(RegisterRequest)) return;
         const auto& request = *reinterpret_cast<const RegisterRequest*>(data);
 
-        RegisterResponse response{};
-        response.header.message_type = MessageType::REGISTER_RESPONSE;
-        response.header.packet_size = sizeof(RegisterResponse);
-
         std::string username = request.username;
         uint64_t pass = 0;
         try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
 
-        auto new_user = user_manager_.CreateUser(username, pass);
-        if (new_user)
-        {
-            response.success = true;
-            response.assigned_user_id = new_user->GetId();
-            std::cout << "[Register Success] New User Created: " << username << " (ID: " << new_user->GetId() << ")" << std::endl;
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "Username already exists.", sizeof(response.error_message) - 1);
-        }
+        user_manager_.CreateUser(username, pass, [session, username](std::shared_ptr<User> new_user) {
+            RegisterResponse response{};
+            response.header.message_type = MessageType::REGISTER_RESPONSE;
+            response.header.packet_size = sizeof(RegisterResponse);
 
-        session->SendMessage(&response, sizeof(RegisterResponse));
+            if (new_user)
+            {
+                response.success = true;
+                response.assigned_user_id = new_user->GetId();
+                std::cout << "[Register Success] New User Created: " << username << " (ID: " << new_user->GetId() << ")" << std::endl;
+            }
+            else
+            {
+                response.success = false;
+                std::strncpy(response.error_message, "Username already exists.", sizeof(response.error_message) - 1);
+            }
+
+            session->SendMessage(&response, sizeof(RegisterResponse));
+        });
     }
 
 private:
@@ -596,11 +606,12 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        auto room = server_.GetRoom(message.room_id);
-        if (room)
-        {
-            room->BroadcastMessage(message, session->GetUserId());
-        }
+        server_.GetRoom(message.room_id, [message, sender_id = session->GetUserId()](std::shared_ptr<ChatRoom> room) {
+            if (room)
+            {
+                room->BroadcastMessage(message, sender_id);
+            }
+        });
     }
 
 private:
@@ -608,13 +619,16 @@ private:
 };
 
 //=====================
-// 서버 생성자 (핸들러 바인딩)
+// 서버 생성자
 //=====================
 ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
-    : acceptor_(io_context, tcp::endpoint(tcp::v4(), port))
+    : io_context_(io_context),
+      strand_(boost::asio::make_strand(io_context)),
+      acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
+      user_manager_(std::make_shared<UserManager>(io_context))
 {
-    dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(user_manager_, *this));
-    dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(user_manager_));
+    dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
+    dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_));
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>(*this));
     do_accept();
 }
@@ -624,11 +638,22 @@ int main()
     try
     {
         boost::asio::io_context io_context;
-        ChatServer server(io_context, 8080);
-        server.CreateRoom(1, "Lobby", 100);
+        auto server = std::make_shared<ChatServer>(io_context, 8080);
+        server->CreateRoom(1, "Lobby", 100);
 
-        std::cout << "[Server] Running on port 8080..." << std::endl;
-        io_context.run();
+        std::cout << "[Server] Running on port 8080 (Strand-based)..." << std::endl;
+        
+        // 멀티스레드 환경에서도 안전하게 작동
+        std::vector<std::thread> threads;
+        for (int i = 0; i < 4; ++i)
+        {
+            threads.emplace_back([&io_context]() { io_context.run(); });
+        }
+
+        for (auto& t : threads)
+        {
+            if (t.joinable()) t.join();
+        }
     }
     catch (std::exception& e)
     {

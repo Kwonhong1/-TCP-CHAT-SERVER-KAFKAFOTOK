@@ -295,7 +295,7 @@ private:
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> connect_failed_{false};
     std::atomic<AuthStatus> auth_status_{AuthStatus::NONE};
-    uint32_t user_id_{0};
+    std::atomic<uint32_t> user_id_{0};
 
     MessageDispatcher dispatcher_;
     PacketBuffer packet_buffer_;
