@@ -485,24 +485,54 @@ int main()
     std::string line;
     std::cin.ignore(); // 입력 버퍼 잔여 줄바꿈 제거
 
-    while (std::cout << "Message: " && std::getline(std::cin, line))
+    while (client->GetAuthStatus() == AuthStatus::SUCCESS)
     {
-        if (line == "exit") break;
+        std::cout << "\n=== Lobby Menu ===" << std::endl;
+        std::cout << "1. Room List (방 목록 조회)" << std::endl;
+        std::cout << "2. Create Room (방 생성)" << std::endl;
+        std::cout << "3. Enter Default Chat (로비 채팅 입장)" << std::endl;
+        std::cout << "4. Exit" << std::endl;
+        std::cout << "Select: ";
 
-        ChatMessage msg{};
-        msg.header.packet_size = sizeof(ChatMessage);
-        msg.header.message_type = MessageType::CHAT_MESSAGE;
-        msg.header.user_id = client->GetUserId();
-        msg.room_id = 1;
-        std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
+        int choice = 0;
+        if (!(std::cin >> choice)) break;
 
-        client->Send(&msg, sizeof(ChatMessage));
+        if (choice == 1) // 방 목록 요청
+        {
+            RoomListRequest req{};
+            req.header.packet_size = sizeof(RoomListRequest);
+            req.header.message_type = MessageType::ROOM_LIST_REQUEST;
+            client->Send(&req, sizeof(RoomListRequest));
+            
+            std::this_thread::sleep_for(std::chrono::milliseconds(200)); // 응답 대기
+        }
+        else if (choice == 2) // 방 생성 요청
+        {
+            std::string room_name;
+            uint32_t max_users = 10;
+            std::cout << "Enter Room Name: ";
+            std::cin >> room_name;
+            std::cout << "Max Users: ";
+            std::cin >> max_users;
+
+            CreateRoomRequest req{};
+            req.header.packet_size = sizeof(CreateRoomRequest);
+            req.header.message_type = MessageType::CREATE_ROOM_REQUEST;
+            std::strncpy(req.room_name, room_name.c_str(), sizeof(req.room_name) - 1);
+            req.max_users = max_users;
+
+            client->Send(&req, sizeof(CreateRoomRequest));
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        else if (choice == 3) // 채팅 시작
+        {
+            break; 
+        }
+        else if (choice == 4)
+        {
+            io_context.stop();
+            if (t.joinable()) t.join();
+            return 0;
+        }
     }
-
-    io_context.stop();
-    if (t.joinable())
-    {
-        t.join();
-    }
-    return 0;
 }
