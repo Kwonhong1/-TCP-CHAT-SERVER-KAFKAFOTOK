@@ -23,7 +23,11 @@ enum class MessageType : uint16_t
     LEAVE_ROOM = 1007,
     REGISTER_REQUEST = 1014,
     REGISTER_RESPONSE = 1015,
-    SERVER_NOTIFICATION = 1013
+    SERVER_NOTIFICATION = 1013,
+    CREATE_ROOM_REQUEST = 1008,
+    CREATE_ROOM_RESPONSE = 1009,
+    ROOM_LIST_REQUEST = 1010,
+    ROOM_LIST_RESPONSE = 1011
 };
 
 #pragma pack(push, 1)
@@ -71,6 +75,45 @@ struct ChatMessage
     uint32_t room_id;
     char message[512];
 };
+
+// 방 요약 정보 구조체
+struct RoomInfo
+{
+    uint32_t room_id;
+    char room_name[32];
+    uint32_t current_users;
+    uint32_t max_users;
+};
+
+// 1. 방 생성 요청/응답
+struct CreateRoomRequest
+{
+    PacketHeader header;
+    char room_name[32];
+    uint32_t max_users;
+};
+
+struct CreateRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t created_room_id;
+    char error_message[128];
+};
+
+// 2. 방 목록 요청/응답 (최대 16개 방 일괄 송신 예시)
+struct RoomListRequest
+{
+    PacketHeader header;
+};
+
+struct RoomListResponse
+{
+    PacketHeader header;
+    uint32_t room_count;
+    RoomInfo rooms[16]; 
+};
+
 #pragma pack(pop)
 
 class ChatServer;
@@ -348,14 +391,20 @@ private:
 class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
 public:
-    ChatRoom(boost::asio::io_context& io_context, std::string name, uint32_t max_users)
-        : strand_(boost::asio::make_strand(io_context)), name_(name), max_users_(max_users) {}
+    ChatRoom(boost::asio::io_context& io_context, uint32_t room_id, std::string name, uint32_t max_users)
+        : strand_(boost::asio::make_strand(io_context)), room_id_(room_id), name_(name), max_users_(max_users), current_users_(0) {}
+
+    uint32_t GetId() const { return room_id_; }
+    std::string GetName() const { return name_; }
+    uint32_t GetMaxUsers() const { return max_users_; }
+    uint32_t GetCurrentUsers() const { return current_users_.load(); }
 
     void AddUser(std::shared_ptr<User> user)
     {
         boost::asio::post(strand_, [this, self = shared_from_this(), user]() {
             if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return;
             users_[user->GetId()] = user;
+            current_users_++; // 인원수 증가
             BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
         });
     }
@@ -367,47 +416,19 @@ public:
             if (it == users_.end()) return;
             std::string username = it->second->GetUsername();
             users_.erase(it);
+            current_users_--; // 인원수 감소
             BroadcastNotification(username + " left the room.", user_id);
         });
     }
 
-    void BroadcastMessage(const ChatMessage& message, uint32_t sender_id)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), message, sender_id]() {
-            for (const auto& [id, user] : users_)
-            {
-                if (id == sender_id) continue;
-                auto session = user->GetSession().lock();
-                if (session) session->SendMessage(&message, sizeof(ChatMessage));
-            }
-        });
-    }
-
 private:
-    void BroadcastNotification(const std::string& notification, uint32_t exclude_user_id)
-    {
-        PacketHeader header{};
-        header.packet_size = sizeof(PacketHeader) + static_cast<uint16_t>(notification.size());
-        header.message_type = MessageType::SERVER_NOTIFICATION;
-
-        std::vector<char> packet(header.packet_size);
-        std::memcpy(packet.data(), &header, sizeof(PacketHeader));
-        std::memcpy(packet.data() + sizeof(PacketHeader), notification.c_str(), notification.size());
-
-        for (const auto& [id, user] : users_)
-        {
-            if (id == exclude_user_id) continue;
-            auto session = user->GetSession().lock();
-            if (session) session->SendMessage(packet.data(), packet.size());
-        }
-    }
-
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    uint32_t room_id_;
     std::string name_;
     uint32_t max_users_;
+    std::atomic<uint32_t> current_users_; // 👈 Atomic 인원수
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
 };
-
 //=====================
 // 서버 클래스 (Strand 적용)
 //=====================
