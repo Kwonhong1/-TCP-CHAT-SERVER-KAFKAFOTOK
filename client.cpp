@@ -381,6 +381,44 @@ public:
     }
 };
 
+class CreateRoomResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(CreateRoomResponse)) return;
+        const auto& res = *reinterpret_cast<const CreateRoomResponse*>(data);
+
+        if (res.success)
+        {
+            std::cout << "\n[System] Room Created Successfully! Room ID: " << res.created_room_id << std::endl;
+        }
+        else
+        {
+            std::cout << "\n[System] Failed to Create Room: " << res.error_message << std::endl;
+        }
+    }
+};
+
+class RoomListResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(RoomListResponse)) return;
+        const auto& res = *reinterpret_cast<const RoomListResponse*>(data);
+
+        std::cout << "\n========== Room List (" << res.room_count << ") ==========" << std::endl;
+        for (uint32_t i = 0; i < res.room_count; ++i)
+        {
+            const auto& r = res.rooms[i];
+            std::cout << "ID: [" << r.room_id << "] " << r.room_name 
+                      << " (" << r.current_users << "/" << r.max_users << ")" << std::endl;
+        }
+        std::cout << "====================================" << std::endl;
+    }
+};
+
 // =========================================================
 // ChatClient 생성자 (핸들러 바인딩)
 // =========================================================
@@ -390,8 +428,12 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
     dispatcher_.RegisterHandler(MessageType::LOGIN_PROMPT, std::make_unique<LoginPromptHandler>());
     dispatcher_.RegisterHandler(MessageType::LOGIN_RESPONSE, std::make_unique<LoginResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::REGISTER_RESPONSE, std::make_unique<RegisterResponseHandler>());
+    
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>());
     dispatcher_.RegisterHandler(MessageType::SERVER_NOTIFICATION, std::make_unique<ServerNotificationHandler>());
+
+    dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_RESPONSE, std::make_unique<CreateRoomResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::ROOM_LIST_RESPONSE, std::make_unique<RoomListResponseHandler>());
 }
 
 // =========================================================
