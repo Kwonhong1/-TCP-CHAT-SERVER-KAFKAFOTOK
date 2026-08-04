@@ -7,6 +7,9 @@
 #include <unordered_map>
 #include <queue>
 #include <cstring>
+#include <thread>
+#include <atomic>
+#include <algorithm>
 
 using boost::asio::ip::tcp;
 
@@ -21,13 +24,18 @@ enum class MessageType : uint16_t
     CHAT_MESSAGE = 1005,
     JOIN_ROOM = 1006,
     LEAVE_ROOM = 1007,
-    REGISTER_REQUEST = 1014,
-    REGISTER_RESPONSE = 1015,
-    SERVER_NOTIFICATION = 1013,
     CREATE_ROOM_REQUEST = 1008,
     CREATE_ROOM_RESPONSE = 1009,
     ROOM_LIST_REQUEST = 1010,
-    ROOM_LIST_RESPONSE = 1011
+    ROOM_LIST_RESPONSE = 1011,
+    SERVER_NOTIFICATION = 1013,
+    REGISTER_REQUEST = 1014,
+    REGISTER_RESPONSE = 1015,
+    JOIN_ROOM_RESPONSE = 1016,  // 추가
+    LEAVE_ROOM_RESPONSE = 1017  // 추가
+    WHISPER_REQUEST=1018,
+    WHISPER_RESPONSE=1019,
+    WHISPER_NOTIFICATION=1020
 };
 
 #pragma pack(push, 1)
@@ -76,7 +84,12 @@ struct ChatMessage
     char message[512];
 };
 
-// 방 요약 정보 구조체
+struct ServerNotification
+{
+    PacketHeader header;
+    char message[256];
+};
+
 struct RoomInfo
 {
     uint32_t room_id;
@@ -85,7 +98,6 @@ struct RoomInfo
     uint32_t max_users;
 };
 
-// 1. 방 생성 요청/응답
 struct CreateRoomRequest
 {
     PacketHeader header;
@@ -101,7 +113,6 @@ struct CreateRoomResponse
     char error_message[128];
 };
 
-// 2. 방 목록 요청/응답 (최대 16개 방 일괄 송신 예시)
 struct RoomListRequest
 {
     PacketHeader header;
@@ -111,9 +122,36 @@ struct RoomListResponse
 {
     PacketHeader header;
     uint32_t room_count;
-    RoomInfo rooms[16]; 
+    RoomInfo rooms[16];
 };
 
+// --- 신규 추가: 방 입장 / 퇴장 패킷 구조체 ---
+struct JoinRoomRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+};
+
+struct JoinRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t room_id;
+    char error_message[128];
+};
+
+struct LeaveRoomRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+};
+
+struct LeaveRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
 #pragma pack(pop)
 
 class ChatServer;
@@ -121,7 +159,7 @@ class ChatRoom;
 class ChatSession;
 
 //=====================
-// 유저 및 관리자 (Strand 적용)
+// 유저 및 관리자
 //=====================
 class User
 {
@@ -286,7 +324,7 @@ private:
 };
 
 //=====================
-// 세션 클래스 (Strand 적용)
+// 세션 클래스
 //=====================
 class ChatSession : public std::enable_shared_from_this<ChatSession>
 {
@@ -386,7 +424,7 @@ private:
 };
 
 //=====================
-// 채팅방 (Strand 적용)
+// 채팅방
 //=====================
 class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
@@ -399,26 +437,82 @@ public:
     uint32_t GetMaxUsers() const { return max_users_; }
     uint32_t GetCurrentUsers() const { return current_users_.load(); }
 
+    template <typename Callback>
+    void AddUser(std::shared_ptr<User> user, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), user, cb = std::forward<Callback>(callback)]() mutable {
+            if (users_.size() >= max_users_) {
+                cb(false, "ROOM_FULL");
+                return;
+            }
+            if (users_.find(user->GetId()) != users_.end()) {
+                cb(false, "ALREADY_IN_ROOM");
+                return;
+            }
+            users_[user->GetId()] = user;
+            current_users_++;
+            BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+            cb(true, "");
+        });
+    }
+
     void AddUser(std::shared_ptr<User> user)
     {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user]() {
-            if (users_.size() >= max_users_ || users_.find(user->GetId()) != users_.end()) return;
-            users_[user->GetId()] = user;
-            current_users_++; // 인원수 증가
-            BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+        AddUser(user, [](bool, const std::string&) {});
+    }
+
+    template <typename Callback>
+    void RemoveUser(uint32_t user_id, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
+            auto it = users_.find(user_id);
+            if (it == users_.end()) {
+                cb(false, "USER_NOT_IN_ROOM");
+                return;
+            }
+            std::string username = it->second->GetUsername();
+            users_.erase(it);
+            current_users_--;
+            BroadcastNotification(username + " left the room.", user_id);
+            cb(true, "");
         });
     }
 
     void RemoveUser(uint32_t user_id)
     {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user_id]() {
-            auto it = users_.find(user_id);
-            if (it == users_.end()) return;
-            std::string username = it->second->GetUsername();
-            users_.erase(it);
-            current_users_--; // 인원수 감소
-            BroadcastNotification(username + " left the room.", user_id);
+        RemoveUser(user_id, [](bool, const std::string&) {});
+    }
+
+    void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
+            for (auto& [id, user] : users_)
+            {
+                if (auto session = user->GetSession().lock())
+                {
+                    session->SendMessage(&msg, sizeof(ChatMessage));
+                }
+            }
         });
+    }
+
+    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0)
+    {
+        ServerNotification notif{};
+        notif.header.packet_size = sizeof(ServerNotification);
+        notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+        notif.header.user_id = 0;
+        notif.header.sequence_number = 0;
+        std::strncpy(notif.message, notification_text.c_str(), sizeof(notif.message) - 1);
+
+        for (auto& [id, user] : users_)
+        {
+            if (id == except_user_id) continue;
+            if (auto session = user->GetSession().lock())
+            {
+                session->SendMessage(&notif, sizeof(ServerNotification));
+            }
+        }
     }
 
 private:
@@ -426,11 +520,12 @@ private:
     uint32_t room_id_;
     std::string name_;
     uint32_t max_users_;
-    std::atomic<uint32_t> current_users_; // 👈 Atomic 인원수
+    std::atomic<uint32_t> current_users_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
 };
+
 //=====================
-// 서버 클래스 (Strand 적용)
+// 서버 클래스
 //=====================
 class ChatServer : public std::enable_shared_from_this<ChatServer>
 {
@@ -452,7 +547,6 @@ public:
         });
     }
 
-
     template <typename Callback>
     void CreateRoom(const std::string& name, uint32_t max_users, Callback&& callback)
     {
@@ -460,12 +554,22 @@ public:
             uint32_t new_room_id = next_room_id_++;
             auto new_room = std::make_shared<ChatRoom>(io_context_, new_room_id, name, max_users);
             rooms_[new_room_id] = new_room;
-            
             std::cout << "[Server] Room Created: " << name << " (ID: " << new_room_id << ")" << std::endl;
             cb(new_room_id);
         });
     }
-    // 전체 방 목록 수집
+
+    void CreateRoom(uint32_t room_id, const std::string& name, uint32_t max_users)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), room_id, name, max_users]() {
+            rooms_[room_id] = std::make_shared<ChatRoom>(io_context_, room_id, name, max_users);
+            if (room_id >= next_room_id_)
+            {
+                next_room_id_ = room_id + 1;
+            }
+        });
+    }
+
     template <typename Callback>
     void GetRoomList(Callback&& callback)
     {
@@ -484,15 +588,49 @@ public:
         });
     }
 
-    MessageDispatcher& GetDispatcher() { return dispatcher_; }
-    UserManager& GetUserManager() { return *user_manager_; }
 
-    void CreateRoom(uint32_t room_id, const std::string& name, uint32_t max_users)
+    template <typename Callback>
+    void SendWhisper(uint32_t sender_id, const std::string& sender_username, const std::string& target_username, const std::string& message, Callback&& callback)
     {
-        boost::asio::post(strand_, [this, self = shared_from_this(), room_id, name, max_users]() {
-            rooms_[room_id] = std::make_shared<ChatRoom>(io_context_, name, max_users);
+        boost::asio::post(strand_, [this, self = shared_from_this(), sender_id, sender_username, target_username, message, cb = std::forward<Callback>(callback)]() mutable {
+            if (sender_username == target_username) {
+                cb(false, "CANNOT_WHISPER_SELF");
+                return;
+            }
+
+            std::shared_ptr<User> target_user = nullptr;
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == target_username) {
+                    target_user = user;
+                    break;
+                }
+            }
+
+            if (!target_user) {
+                cb(false, "USER_NOT_IN_ROOM");
+                return;
+            }
+
+            auto target_session = target_user->GetSession().lock();
+            if (!target_session) {
+                cb(false, "TARGET_DISCONNECTED");
+                return;
+            }
+
+            // 받는 유저에게 귓속말 전송
+            WhisperNotification notif{};
+            notif.header.packet_size = sizeof(WhisperNotification);
+            notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
+            std::strncpy(notif.sender_username, sender_username.c_str(), sizeof(notif.sender_username) - 1);
+            std::strncpy(notif.message, message.c_str(), sizeof(notif.message) - 1);
+
+            target_session->SendMessage(&notif, sizeof(WhisperNotification));
+            cb(true, "");
         });
     }
+
+    MessageDispatcher& GetDispatcher() { return dispatcher_; }
+    UserManager& GetUserManager() { return *user_manager_; }
 
     template <typename Callback>
     void GetRoom(uint32_t room_id, Callback&& callback)
@@ -518,8 +656,7 @@ private:
     MessageDispatcher dispatcher_;
     std::shared_ptr<UserManager> user_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
-
-    
+    uint32_t next_room_id_ = 1;
 };
 
 void ChatSession::Start()
@@ -553,9 +690,8 @@ void ChatSession::ProcessPacket(const char* data, size_t size)
 }
 
 //=====================
-// 메시지 핸들러 구현부 (비동기 콜백 적용)
+// 메시지 핸들러 구현부
 //=====================
-// 1. 방 생성 핸들러
 class CreateRoomHandler : public IMessageHandler
 {
 public:
@@ -584,7 +720,6 @@ private:
     ChatServer& server_;
 };
 
-// 2. 방 목록 조회 핸들러
 class RoomListHandler : public IMessageHandler
 {
 public:
@@ -612,6 +747,7 @@ public:
 private:
     ChatServer& server_;
 };
+
 class LoginHandler : public IMessageHandler
 {
 public:
@@ -730,6 +866,156 @@ private:
     ChatServer& server_;
 };
 
+// --- 신규 추가: JOIN_ROOM 처리 핸들러 ---
+class JoinRoomHandler : public IMessageHandler
+{
+public:
+    JoinRoomHandler(UserManager& user_manager, ChatServer& server)
+        : user_manager_(user_manager), server_(server) {}
+
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(JoinRoomRequest)) return;
+        const auto& req = *reinterpret_cast<const JoinRoomRequest*>(data);
+
+        uint32_t user_id = session->GetUserId();
+        uint32_t target_room_id = req.room_id;
+
+        user_manager_.GetUser(user_id, [this, session, target_room_id, user_id](std::shared_ptr<User> user) {
+            if (!user) return;
+
+            server_.GetRoom(target_room_id, [session, user, target_room_id, user_id](std::shared_ptr<ChatRoom> room) {
+                JoinRoomResponse res{};
+                res.header.message_type = MessageType::JOIN_ROOM_RESPONSE;
+                res.header.packet_size = sizeof(JoinRoomResponse);
+                res.room_id = target_room_id;
+
+                if (!room)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(JoinRoomResponse));
+                    return;
+                }
+
+                room->AddUser(user, [session, res, user_id, target_room_id](bool success, const std::string& err) mutable {
+                    res.success = success;
+                    if (!success)
+                    {
+                        std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                    }
+                    else
+                    {
+                        std::cout << "[Room] User " << user_id << " joined room " << target_room_id << std::endl;
+                    }
+                    session->SendMessage(&res, sizeof(JoinRoomResponse));
+                });
+            });
+        });
+    }
+
+private:
+    UserManager& user_manager_;
+    ChatServer& server_;
+};
+
+// --- 신규 추가: LEAVE_ROOM 처리 핸들러 ---
+class LeaveRoomHandler : public IMessageHandler
+{
+public:
+    explicit LeaveRoomHandler(ChatServer& server) : server_(server) {}
+
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(LeaveRoomRequest)) return;
+        const auto& req = *reinterpret_cast<const LeaveRoomRequest*>(data);
+
+        uint32_t user_id = session->GetUserId();
+        uint32_t target_room_id = req.room_id;
+
+        server_.GetRoom(target_room_id, [session, user_id](std::shared_ptr<ChatRoom> room) {
+            LeaveRoomResponse res{};
+            res.header.message_type = MessageType::LEAVE_ROOM_RESPONSE;
+            res.header.packet_size = sizeof(LeaveRoomResponse);
+
+            if (!room)
+            {
+                res.success = false;
+                std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                session->SendMessage(&res, sizeof(LeaveRoomResponse));
+                return;
+            }
+
+            room->RemoveUser(user_id, [session, res, user_id, room](bool success, const std::string& err) mutable {
+                res.success = success;
+                if (!success)
+                {
+                    std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                }
+                else
+                {
+                    std::cout << "[Room] User " << user_id << " left room " << room->GetId() << std::endl;
+                }
+                session->SendMessage(&res, sizeof(LeaveRoomResponse));
+            });
+        });
+    }
+
+private:
+    ChatServer& server_;
+};
+
+class WhisperHandler : public IMessageHandler
+{
+public:
+    WhisperHandler(UserManager& user_manager, ChatServer& server)
+        : user_manager_(user_manager), server_(server) {}
+
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(WhisperRequest)) return;
+        const auto& req = *reinterpret_cast<const WhisperRequest*>(data);
+
+        uint32_t sender_id = session->GetUserId();
+        std::string target_username = req.target_username;
+        std::string message = req.message;
+        uint32_t room_id = req.room_id;
+
+        user_manager_.GetUser(sender_id, [this, session, sender_id, target_username, message, room_id](std::shared_ptr<User> sender_user) {
+            if (!sender_user) return;
+
+            server_.GetRoom(room_id, [session, sender_user, sender_id, target_username, message](std::shared_ptr<ChatRoom> room) {
+                WhisperResponse res{};
+                res.header.message_type = MessageType::WHISPER_RESPONSE;
+                res.header.packet_size = sizeof(WhisperResponse);
+
+                if (!room)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                    return;
+                }
+
+                room->SendWhisper(sender_id, sender_user->GetUsername(), target_username, message, [session, res](bool success, const std::string& err) mutable {
+                    res.success = success;
+                    if (!success)
+                    {
+                        std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                    }
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                });
+            });
+        });
+    }
+
+private:
+    UserManager& user_manager_;
+    ChatServer& server_;
+};
+
+
+
 //=====================
 // 서버 생성자
 //=====================
@@ -742,9 +1028,14 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_));
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>(*this));
-
     dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_REQUEST, std::make_unique<CreateRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::ROOM_LIST_REQUEST, std::make_unique<RoomListHandler>(*this));
+
+    // --- 핸들러 등록 ---
+    dispatcher_.RegisterHandler(MessageType::JOIN_ROOM, std::make_unique<JoinRoomHandler>(*user_manager_, *this));
+    dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
+    dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
+    
     do_accept();
 }
 
@@ -757,8 +1048,7 @@ int main()
         server->CreateRoom(1, "Lobby", 100);
 
         std::cout << "[Server] Running on port 8080 (Strand-based)..." << std::endl;
-        
-        // 멀티스레드 환경에서도 안전하게 작동
+
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
         {

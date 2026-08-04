@@ -10,6 +10,9 @@
 #include <unordered_map>
 #include <atomic>
 #include <chrono>
+#include <limits>
+#include <algorithm>
+#include <sstream>
 
 using boost::asio::ip::tcp;
 
@@ -26,9 +29,18 @@ enum class MessageType : uint16_t
     CHAT_MESSAGE = 1005,
     JOIN_ROOM = 1006,
     LEAVE_ROOM = 1007,
+    CREATE_ROOM_REQUEST = 1008,
+    CREATE_ROOM_RESPONSE = 1009,
+    ROOM_LIST_REQUEST = 1010,
+    ROOM_LIST_RESPONSE = 1011,
+    SERVER_NOTIFICATION = 1013,
     REGISTER_REQUEST = 1014,
     REGISTER_RESPONSE = 1015,
-    SERVER_NOTIFICATION = 1013
+    JOIN_ROOM_RESPONSE = 1016,
+    LEAVE_ROOM_RESPONSE = 1017,
+    WHISPER_REQUEST = 1018,      // 추가: 귓속말 요청
+    WHISPER_RESPONSE = 1019,     // 추가: 귓속말 응답
+    WHISPER_NOTIFICATION = 1020  // 추가: 귓속말 알림
 };
 
 enum class AuthStatus
@@ -82,6 +94,91 @@ struct ChatMessage
 {
     PacketHeader header;
     uint32_t room_id;
+    char message[512];
+};
+
+struct RoomInfo
+{
+    uint32_t room_id;
+    char room_name[32];
+    uint32_t current_users;
+    uint32_t max_users;
+};
+
+struct CreateRoomRequest
+{
+    PacketHeader header;
+    char room_name[32];
+    uint32_t max_users;
+};
+
+struct CreateRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t created_room_id;
+    char error_message[128];
+};
+
+struct RoomListRequest
+{
+    PacketHeader header;
+};
+
+struct RoomListResponse
+{
+    PacketHeader header;
+    uint32_t room_count;
+    RoomInfo rooms[16];
+};
+
+struct JoinRoomRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+};
+
+struct JoinRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t room_id;
+    char error_message[128];
+};
+
+struct LeaveRoomRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+};
+
+struct LeaveRoomResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
+
+// --- 신규 추가: 귓속말 관련 패킷 구조체 ---
+struct WhisperRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    char target_username[32];
+    char message[512];
+};
+
+struct WhisperResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
+
+struct WhisperNotification
+{
+    PacketHeader header;
+    char sender_username[32];
     char message[512];
 };
 #pragma pack(pop)
@@ -419,6 +516,74 @@ public:
     }
 };
 
+class JoinRoomResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(JoinRoomResponse)) return;
+        const auto& res = *reinterpret_cast<const JoinRoomResponse*>(data);
+
+        if (res.success)
+        {
+            std::cout << "\n[System] Successfully joined room ID: " << res.room_id << std::endl;
+        }
+        else
+        {
+            std::cout << "\n[System] Failed to join room: " << res.error_message << std::endl;
+        }
+    }
+};
+
+class LeaveRoomResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(LeaveRoomResponse)) return;
+        const auto& res = *reinterpret_cast<const LeaveRoomResponse*>(data);
+
+        if (res.success)
+        {
+            std::cout << "\n[System] Successfully left room." << std::endl;
+        }
+        else
+        {
+            std::cout << "\n[System] Failed to leave room: " << res.error_message << std::endl;
+        }
+    }
+};
+
+// --- 신규 추가: 귓속말 응답 및 수신 알림 핸들러 ---
+class WhisperResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(WhisperResponse)) return;
+        const auto& res = *reinterpret_cast<const WhisperResponse*>(data);
+
+        if (!res.success)
+        {
+            std::cout << "\n[System] 귓속말 전송 실패: " << res.error_message << std::endl;
+            std::cout << "Message: " << std::flush;
+        }
+    }
+};
+
+class WhisperNotificationHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(WhisperNotification)) return;
+        const auto& notif = *reinterpret_cast<const WhisperNotification*>(data);
+
+        std::cout << "\n[귓속말 - " << notif.sender_username << "]: " << notif.message << std::endl;
+        std::cout << "Message: " << std::flush;
+    }
+};
+
 // =========================================================
 // ChatClient 생성자 (핸들러 바인딩)
 // =========================================================
@@ -428,12 +593,17 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
     dispatcher_.RegisterHandler(MessageType::LOGIN_PROMPT, std::make_unique<LoginPromptHandler>());
     dispatcher_.RegisterHandler(MessageType::LOGIN_RESPONSE, std::make_unique<LoginResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::REGISTER_RESPONSE, std::make_unique<RegisterResponseHandler>());
-    
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>());
     dispatcher_.RegisterHandler(MessageType::SERVER_NOTIFICATION, std::make_unique<ServerNotificationHandler>());
 
     dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_RESPONSE, std::make_unique<CreateRoomResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::ROOM_LIST_RESPONSE, std::make_unique<RoomListResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::JOIN_ROOM_RESPONSE, std::make_unique<JoinRoomResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM_RESPONSE, std::make_unique<LeaveRoomResponseHandler>());
+
+    // --- 귓속말 핸들러 등록 ---
+    dispatcher_.RegisterHandler(MessageType::WHISPER_RESPONSE, std::make_unique<WhisperResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::WHISPER_NOTIFICATION, std::make_unique<WhisperNotificationHandler>());
 }
 
 // =========================================================
@@ -444,13 +614,12 @@ int main()
     boost::asio::io_context io_context;
 
     auto client = std::make_shared<ChatClient>(io_context);
-    
     std::cout << "[System] Connecting to server..." << std::endl;
     client->Start("127.0.0.1", "8080");
 
     std::thread t([&io_context]() { io_context.run(); });
 
-    // 1. 소켓 연결이 완료될 때까지 대기
+    // 1. 소켓 연결 대기
     while (!client->IsConnected() && !client->IsConnectFailed())
     {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
@@ -464,10 +633,9 @@ int main()
         return 0;
     }
 
-    // 2. 연결 완료 후 LOGIN_PROMPT 수신 시간을 위한 짧은 유예 시간
     std::this_thread::sleep_for(std::chrono::milliseconds(100));
 
-    // 3. 로그인 완료될 때까지 메뉴 루프 실행
+    // 2. 인증 메뉴 루프
     while (client->GetAuthStatus() != AuthStatus::SUCCESS)
     {
         std::cout << "\n=========================" << std::endl;
@@ -515,25 +683,21 @@ int main()
             client->Send(&req, sizeof(LoginRequest));
         }
 
-        // 서버 응답 패킷 올 때까지 대기
         while (client->GetAuthStatus() == AuthStatus::WAITING)
         {
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
         }
     }
 
-    // 4. 로그인 성공 후 채팅 입력 루프 시작
-    std::cout << "\n--- Entered Chat Room (Lobby) ---" << std::endl;
-    std::string line;
-    std::cin.ignore(); // 입력 버퍼 잔여 줄바꿈 제거
-
-    while (client->GetAuthStatus() == AuthStatus::SUCCESS)
+    // 3. 로비 메뉴 및 채팅 루프
+    bool is_running = true;
+    while (client->IsConnected() && is_running)
     {
         std::cout << "\n=== Lobby Menu ===" << std::endl;
         std::cout << "1. Room List (방 목록 조회)" << std::endl;
         std::cout << "2. Create Room (방 생성)" << std::endl;
-        std::cout << "3. Enter Default Chat (로비 채팅 입장)" << std::endl;
-        std::cout << "4. Exit" << std::endl;
+        std::cout << "3. Enter Room (방 입장)" << std::endl;
+        std::cout << "4. Exit (종료)" << std::endl;
         std::cout << "Select: ";
 
         int choice = 0;
@@ -545,8 +709,7 @@ int main()
             req.header.packet_size = sizeof(RoomListRequest);
             req.header.message_type = MessageType::ROOM_LIST_REQUEST;
             client->Send(&req, sizeof(RoomListRequest));
-            
-            std::this_thread::sleep_for(std::chrono::milliseconds(200)); // 응답 대기
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
         else if (choice == 2) // 방 생성 요청
         {
@@ -566,15 +729,98 @@ int main()
             client->Send(&req, sizeof(CreateRoomRequest));
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        else if (choice == 3) // 채팅 시작
+        else if (choice == 3) // 특정 방 입장
         {
-            break; 
+            uint32_t target_room_id = 1;
+            std::cout << "Enter Room ID to join (e.g. 1 for Lobby): ";
+            if (!(std::cin >> target_room_id)) target_room_id = 1;
+
+            // 1) JOIN_ROOM 패킷 전송
+            JoinRoomRequest join_req{};
+            join_req.header.packet_size = sizeof(JoinRoomRequest);
+            join_req.header.message_type = MessageType::JOIN_ROOM;
+            join_req.header.user_id = client->GetUserId();
+            join_req.room_id = target_room_id;
+
+            client->Send(&join_req, sizeof(JoinRoomRequest));
+
+            std::cout << "\n==========================================" << std::endl;
+            std::cout << " Entered Room [" << target_room_id << "]" << std::endl;
+            std::cout << " Whisper Usage: /w <Username> <Message>" << std::endl;
+            std::cout << " Type '/quit' or '/exit' to leave room." << std::endl;
+            std::cout << "==========================================" << std::endl;
+
+            // cin 버퍼 개행 문자 제거
+            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+
+            std::string line;
+            while (client->IsConnected())
+            {
+                std::cout << "Message: ";
+                if (!std::getline(std::cin, line)) break;
+
+                // '/quit' 또는 '/exit' 입력 시 방 퇴장
+                if (line == "/quit" || line == "/exit")
+                {
+                    LeaveRoomRequest leave_req{};
+                    leave_req.header.packet_size = sizeof(LeaveRoomRequest);
+                    leave_req.header.message_type = MessageType::LEAVE_ROOM;
+                    leave_req.header.user_id = client->GetUserId();
+                    leave_req.room_id = target_room_id;
+
+                    client->Send(&leave_req, sizeof(LeaveRoomRequest));
+                    std::cout << "[System] Left Room " << target_room_id << ", returning to Lobby menu..." << std::endl;
+                    break;
+                }
+
+                if (line.empty()) continue;
+
+                // --- 귓속말 명령 처리 (/w 유저명 메시지 또는 /whisper 유저명 메시지) ---
+                if (line.rfind("/w ", 0) == 0 || line.rfind("/whisper ", 0) == 0)
+                {
+                    std::stringstream ss(line);
+                    std::string cmd, target_user, msg_body;
+                    ss >> cmd >> target_user;
+                    std::getline(ss >> std::ws, msg_body);
+
+                    if (target_user.empty() || msg_body.empty())
+                    {
+                        std::cout << "[System] Usage: /w <Username> <Message>" << std::endl;
+                        continue;
+                    }
+
+                    WhisperRequest req{};
+                    req.header.packet_size = sizeof(WhisperRequest);
+                    req.header.message_type = MessageType::WHISPER_REQUEST;
+                    req.header.user_id = client->GetUserId();
+                    req.room_id = target_room_id;
+                    std::strncpy(req.target_username, target_user.c_str(), sizeof(req.target_username) - 1);
+                    std::strncpy(req.message, msg_body.c_str(), sizeof(req.message) - 1);
+
+                    client->Send(&req, sizeof(WhisperRequest));
+                    continue;
+                }
+
+                // 일반 전체 채팅
+                ChatMessage msg{};
+                msg.header.packet_size = sizeof(ChatMessage);
+                msg.header.message_type = MessageType::CHAT_MESSAGE;
+                msg.header.user_id = client->GetUserId();
+                msg.room_id = target_room_id;
+                std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
+
+                client->Send(&msg, sizeof(ChatMessage));
+            }
         }
-        else if (choice == 4)
+        else if (choice == 4) // 종료
         {
-            io_context.stop();
-            if (t.joinable()) t.join();
-            return 0;
+            is_running = false;
         }
     }
+
+    std::cout << "[System] Disconnecting and shutting down..." << std::endl;
+    io_context.stop();
+    if (t.joinable()) t.join();
+
+    return 0;
 }
