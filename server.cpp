@@ -10,7 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
-#include <chorono>
+#include <chrono>
 
 using boost::asio::ip::tcp;
 
@@ -32,11 +32,11 @@ enum class MessageType : uint16_t
     SERVER_NOTIFICATION = 1013,
     REGISTER_REQUEST = 1014,
     REGISTER_RESPONSE = 1015,
-    JOIN_ROOM_RESPONSE = 1016,  // 추가
-    LEAVE_ROOM_RESPONSE = 1017  // 추가
-    WHISPER_REQUEST=1018,
-    WHISPER_RESPONSE=1019,
-    WHISPER_NOTIFICATION=1020
+    JOIN_ROOM_RESPONSE = 1016,
+    LEAVE_ROOM_RESPONSE = 1017,
+    WHISPER_REQUEST = 1018,
+    WHISPER_RESPONSE = 1019,
+    WHISPER_NOTIFICATION = 1020
 };
 
 #pragma pack(push, 1)
@@ -126,7 +126,6 @@ struct RoomListResponse
     RoomInfo rooms[16];
 };
 
-// --- 신규 추가: 방 입장 / 퇴장 패킷 구조체 ---
 struct JoinRoomRequest
 {
     PacketHeader header;
@@ -152,6 +151,28 @@ struct LeaveRoomResponse
     PacketHeader header;
     bool success;
     char error_message[128];
+};
+
+struct WhisperRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    char target_username[32];
+    char message[512];
+};
+
+struct WhisperResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
+
+struct WhisperNotification
+{
+    PacketHeader header;
+    char sender_username[32];
+    char message[512];
 };
 #pragma pack(pop)
 
@@ -332,7 +353,7 @@ class ChatSession : public std::enable_shared_from_this<ChatSession>
 public:
     ChatSession(tcp::socket socket, ChatServer& server)
         : strand_(boost::asio::make_strand(socket.get_executor())),
-          socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false),idle_timer_(strand_) {}
+          socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false), idle_timer_(strand_) {}
 
     ~ChatSession()
     {
@@ -366,6 +387,7 @@ public:
     bool IsAuthenticated() const { return is_authenticated_; }
 
     void Disconnect();
+    void ResetTimer();
 
 private:
     void Do_read()
@@ -420,8 +442,7 @@ private:
     uint32_t user_id_;
     bool is_authenticated_;
     bool is_disconnected_;
-    booost::asio::steady_timer idle_timer_;
-    
+    boost::asio::steady_timer idle_timer_;
     std::queue<std::vector<char>> write_queue_;
     std::vector<char> read_buffer_ = std::vector<char>(4096);
     PacketBuffer packet_buffer_;
@@ -536,6 +557,10 @@ class ChatServer : public std::enable_shared_from_this<ChatServer>
 public:
     ChatServer(boost::asio::io_context& io_context, short port);
 
+    boost::asio::io_context& GetIOContext() { return io_context_; }
+    MessageDispatcher& GetDispatcher() { return dispatcher_; }
+    UserManager& GetUserManager() { return *user_manager_; }
+
     void OnSessionDisconnected(std::shared_ptr<ChatSession> session)
     {
         uint32_t user_id = session->GetUserId();
@@ -591,50 +616,6 @@ public:
             cb(room_list);
         });
     }
-
-
-    template <typename Callback>
-    void SendWhisper(uint32_t sender_id, const std::string& sender_username, const std::string& target_username, const std::string& message, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), sender_id, sender_username, target_username, message, cb = std::forward<Callback>(callback)]() mutable {
-            if (sender_username == target_username) {
-                cb(false, "CANNOT_WHISPER_SELF");
-                return;
-            }
-
-            std::shared_ptr<User> target_user = nullptr;
-            for (const auto& [id, user] : users_) {
-                if (user->GetUsername() == target_username) {
-                    target_user = user;
-                    break;
-                }
-            }
-
-            if (!target_user) {
-                cb(false, "USER_NOT_IN_ROOM");
-                return;
-            }
-
-            auto target_session = target_user->GetSession().lock();
-            if (!target_session) {
-                cb(false, "TARGET_DISCONNECTED");
-                return;
-            }
-
-            // 받는 유저에게 귓속말 전송
-            WhisperNotification notif{};
-            notif.header.packet_size = sizeof(WhisperNotification);
-            notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
-            std::strncpy(notif.sender_username, sender_username.c_str(), sizeof(notif.sender_username) - 1);
-            std::strncpy(notif.message, message.c_str(), sizeof(notif.message) - 1);
-
-            target_session->SendMessage(&notif, sizeof(WhisperNotification));
-            cb(true, "");
-        });
-    }
-
-    MessageDispatcher& GetDispatcher() { return dispatcher_; }
-    UserManager& GetUserManager() { return *user_manager_; }
 
     template <typename Callback>
     void GetRoom(uint32_t room_id, Callback&& callback)
@@ -694,13 +675,14 @@ void ChatSession::ProcessPacket(const char* data, size_t size)
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
     server_.GetDispatcher().DispatchMessage(shared_from_this(), header, data, size);
 }
+
 void ChatSession::ResetTimer()
 {
     idle_timer_.expires_after(std::chrono::seconds(300));
     idle_timer_.async_wait(boost::asio::bind_executor(strand_, [this, self = shared_from_this()](boost::system::error_code ec) {
         if (!ec)
         {
-            std::cout << "[System] Session timed out due to inactivity. User ID: "<<user_id << '\n';
+            std::cout << "[System] Session timed out due to inactivity. User ID: " << user_id_ << '\n';
             Disconnect();
         }
     }));
@@ -825,7 +807,7 @@ private:
 class RegisterHandler : public IMessageHandler
 {
 public:
-    RegisterHandler(UserManager& user_manager) : user_manager_(user_manager) {}
+    explicit RegisterHandler(UserManager& user_manager) : user_manager_(user_manager) {}
 
     void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
@@ -864,7 +846,7 @@ private:
 class ChatMessageHandler : public IMessageHandler
 {
 public:
-    ChatMessageHandler(ChatServer& server) : server_(server) {}
+    explicit ChatMessageHandler(ChatServer& server) : server_(server) {}
 
     void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
@@ -883,7 +865,6 @@ private:
     ChatServer& server_;
 };
 
-// --- 신규 추가: JOIN_ROOM 처리 핸들러 ---
 class JoinRoomHandler : public IMessageHandler
 {
 public:
@@ -936,7 +917,6 @@ private:
     ChatServer& server_;
 };
 
-// --- 신규 추가: LEAVE_ROOM 처리 핸들러 ---
 class LeaveRoomHandler : public IMessageHandler
 {
 public:
@@ -982,6 +962,7 @@ private:
     ChatServer& server_;
 };
 
+// 귓속말 로직을 완전히 직접 처리하도록 이관된 핸들러
 class WhisperHandler : public IMessageHandler
 {
 public:
@@ -998,10 +979,12 @@ public:
         std::string message = req.message;
         uint32_t room_id = req.room_id;
 
+        // 1. 보낸 유저 검증
         user_manager_.GetUser(sender_id, [this, session, sender_id, target_username, message, room_id](std::shared_ptr<User> sender_user) {
             if (!sender_user) return;
 
-            server_.GetRoom(room_id, [session, sender_user, sender_id, target_username, message](std::shared_ptr<ChatRoom> room) {
+            // 2. 채팅방 존재 확인
+            server_.GetRoom(room_id, [this, session, sender_user, target_username, message](std::shared_ptr<ChatRoom> room) {
                 WhisperResponse res{};
                 res.header.message_type = MessageType::WHISPER_RESPONSE;
                 res.header.packet_size = sizeof(WhisperResponse);
@@ -1014,12 +997,38 @@ public:
                     return;
                 }
 
-                room->SendWhisper(sender_id, sender_user->GetUsername(), target_username, message, [session, res](bool success, const std::string& err) mutable {
-                    res.success = success;
-                    if (!success)
+                if (sender_user->GetUsername() == target_username)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "CANNOT_WHISPER_SELF", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                    return;
+                }
+
+                // 3. 수신 대상 유저 검색 및 알림 패킷 직접 전송
+                user_manager_.GetUserByUsername(target_username, [session, sender_user, message, res](std::shared_ptr<User> target_user) mutable {
+                    if (!target_user)
                     {
-                        std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                        res.success = false;
+                        std::strncpy(res.error_message, "USER_NOT_FOUND", sizeof(res.error_message) - 1);
                     }
+                    else if (auto target_session = target_user->GetSession().lock())
+                    {
+                        WhisperNotification notif{};
+                        notif.header.packet_size = sizeof(WhisperNotification);
+                        notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
+                        std::strncpy(notif.sender_username, sender_user->GetUsername().c_str(), sizeof(notif.sender_username) - 1);
+                        std::strncpy(notif.message, message.c_str(), sizeof(notif.message) - 1);
+
+                        target_session->SendMessage(&notif, sizeof(WhisperNotification));
+                        res.success = true;
+                    }
+                    else
+                    {
+                        res.success = false;
+                        std::strncpy(res.error_message, "TARGET_DISCONNECTED", sizeof(res.error_message) - 1);
+                    }
+
                     session->SendMessage(&res, sizeof(WhisperResponse));
                 });
             });
@@ -1030,8 +1039,6 @@ private:
     UserManager& user_manager_;
     ChatServer& server_;
 };
-
-
 
 //=====================
 // 서버 생성자
@@ -1047,8 +1054,6 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_REQUEST, std::make_unique<CreateRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::ROOM_LIST_REQUEST, std::make_unique<RoomListHandler>(*this));
-
-    // --- 핸들러 등록 ---
     dispatcher_.RegisterHandler(MessageType::JOIN_ROOM, std::make_unique<JoinRoomHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
