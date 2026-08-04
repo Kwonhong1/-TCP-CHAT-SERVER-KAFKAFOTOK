@@ -10,6 +10,7 @@
 #include <thread>
 #include <atomic>
 #include <algorithm>
+#include <chorono>
 
 using boost::asio::ip::tcp;
 
@@ -331,11 +332,12 @@ class ChatSession : public std::enable_shared_from_this<ChatSession>
 public:
     ChatSession(tcp::socket socket, ChatServer& server)
         : strand_(boost::asio::make_strand(socket.get_executor())),
-          socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false) {}
+          socket_(std::move(socket)), server_(server), user_id_(0), is_authenticated_(false), is_disconnected_(false),idle_timer_(strand_) {}
 
     ~ChatSession()
     {
         boost::system::error_code ec;
+        idle_timer_.cancel(ec);
         socket_.close(ec);
     }
 
@@ -373,6 +375,7 @@ private:
             boost::asio::bind_executor(strand_, [this, self](boost::system::error_code ec, std::size_t length) {
                 if (!ec)
                 {
+                    ResetTimer();
                     packet_buffer_.WriteData(read_buffer_.data(), length);
                     std::vector<char> packet_data;
                     while (packet_buffer_.ReadPacket(packet_data))
@@ -417,7 +420,8 @@ private:
     uint32_t user_id_;
     bool is_authenticated_;
     bool is_disconnected_;
-
+    booost::asio::steady_timer idle_timer_;
+    
     std::queue<std::vector<char>> write_queue_;
     std::vector<char> read_buffer_ = std::vector<char>(4096);
     PacketBuffer packet_buffer_;
@@ -661,6 +665,7 @@ private:
 
 void ChatSession::Start()
 {
+    ResetTimer();
     Do_read();
 
     PacketHeader prompt_header{};
@@ -678,6 +683,7 @@ void ChatSession::Disconnect()
     is_disconnected_ = true;
 
     boost::system::error_code ec;
+    idle_timer_.cancel(ec);
     socket_.close(ec);
     server_.OnSessionDisconnected(shared_from_this());
 }
@@ -687,6 +693,17 @@ void ChatSession::ProcessPacket(const char* data, size_t size)
     if (size < sizeof(PacketHeader)) return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
     server_.GetDispatcher().DispatchMessage(shared_from_this(), header, data, size);
+}
+void ChatSession::ResetTimer()
+{
+    idle_timer_.expires_after(std::chrono::seconds(300));
+    idle_timer_.async_wait(boost::asio::bind_executor(strand_, [this, self = shared_from_this()](boost::system::error_code ec) {
+        if (!ec)
+        {
+            std::cout << "[System] Session timed out due to inactivity. User ID: "<<user_id << '\n';
+            Disconnect();
+        }
+    }));
 }
 
 //=====================
@@ -1035,7 +1052,7 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::JOIN_ROOM, std::make_unique<JoinRoomHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
-    
+
     do_accept();
 }
 
