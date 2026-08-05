@@ -38,9 +38,11 @@ enum class MessageType : uint16_t
     REGISTER_RESPONSE = 1015,
     JOIN_ROOM_RESPONSE = 1016,
     LEAVE_ROOM_RESPONSE = 1017,
-    WHISPER_REQUEST = 1018,      // 추가: 귓속말 요청
-    WHISPER_RESPONSE = 1019,     // 추가: 귓속말 응답
-    WHISPER_NOTIFICATION = 1020  // 추가: 귓속말 알림
+    WHISPER_REQUEST = 1018,
+    WHISPER_RESPONSE = 1019,
+    WHISPER_NOTIFICATION = 1020,
+    RECONNECT_REQUEST = 1021, // 추가
+    RECONNECT_RESPONSE = 1022  // 추가
 };
 
 enum class AuthStatus
@@ -72,6 +74,7 @@ struct LoginResponse
     PacketHeader header;
     bool success;
     uint32_t assigned_user_id;
+    char reconnect_token[64]; // 추가: 재접속 인증 토큰
     char error_message[128];
 };
 
@@ -159,7 +162,6 @@ struct LeaveRoomResponse
     char error_message[128];
 };
 
-// --- 신규 추가: 귓속말 관련 패킷 구조체 ---
 struct WhisperRequest
 {
     PacketHeader header;
@@ -180,6 +182,23 @@ struct WhisperNotification
     PacketHeader header;
     char sender_username[32];
     char message[512];
+};
+
+// 재접속 패킷
+struct ReconnectRequest
+{
+    PacketHeader header;
+    uint32_t user_id;
+    char reconnect_token[64];
+    uint32_t last_room_id;
+};
+
+struct ReconnectResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t restored_room_id;
+    char error_message[128];
 };
 #pragma pack(pop)
 
@@ -280,6 +299,8 @@ public:
 
     void Start(const std::string& host, const std::string& port)
     {
+        host_ = host;
+        port_ = port;
         tcp::resolver resolver(io_context_);
         endpoints_ = resolver.resolve(host, port);
         DoConnect();
@@ -308,6 +329,12 @@ public:
     void SetAuthStatus(AuthStatus status) { auth_status_ = status; }
     AuthStatus GetAuthStatus() const { return auth_status_; }
 
+    void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
+    std::string GetReconnectToken() const { return reconnect_token_; }
+
+    void SetLastRoomId(uint32_t room_id) { last_room_id_ = room_id; }
+    uint32_t GetLastRoomId() const { return last_room_id_; }
+
     bool IsConnected() const { return is_connected_; }
     bool IsConnectFailed() const { return connect_failed_; }
 
@@ -320,6 +347,14 @@ private:
                 {
                     std::cout << "[System] Connected to server!" << std::endl;
                     is_connected_ = true;
+                    connect_failed_ = false;
+
+                    // 재접속 토큰이 존재할 경우 자동 복구 요청 시도
+                    if (!reconnect_token_.empty() && user_id_ != 0)
+                    {
+                        SendReconnectRequest();
+                    }
+
                     DoRead();
 
                     if (!write_queue_.empty())
@@ -333,6 +368,20 @@ private:
                     connect_failed_ = true;
                 }
             });
+    }
+
+    void SendReconnectRequest()
+    {
+        ReconnectRequest req{};
+        req.header.packet_size = sizeof(ReconnectRequest);
+        req.header.message_type = MessageType::RECONNECT_REQUEST;
+        req.header.user_id = user_id_;
+        req.user_id = user_id_;
+        req.last_room_id = last_room_id_;
+        std::strncpy(req.reconnect_token, reconnect_token_.c_str(), sizeof(req.reconnect_token) - 1);
+
+        Send(&req, sizeof(ReconnectRequest));
+        std::cout << "[System] Attempting automatic reconnection to server..." << std::endl;
     }
 
     void DoRead()
@@ -353,10 +402,34 @@ private:
                 {
                     std::cout << "\n[System] Disconnected from server." << std::endl;
                     is_connected_ = false;
-                    auth_status_ = AuthStatus::FAILED;
-                    socket_.close();
+                    boost::system::error_code close_ec;
+                    socket_.close(close_ec);
+
+                    // 로그인 성공 이력이 있으면 3초 뒤 자동 재연결 시도
+                    if (auth_status_ == AuthStatus::SUCCESS && !reconnect_token_.empty())
+                    {
+                        ScheduleReconnect();
+                    }
+                    else
+                    {
+                        auth_status_ = AuthStatus::FAILED;
+                    }
                 }
             });
+    }
+
+    void ScheduleReconnect()
+    {
+        reconnect_timer_.expires_after(std::chrono::seconds(3));
+        reconnect_timer_.async_wait([this, self = shared_from_this()](boost::system::error_code ec) {
+            if (!ec)
+            {
+                std::cout << "[System] Trying to reconnect..." << std::endl;
+                tcp::resolver resolver(io_context_);
+                endpoints_ = resolver.resolve(host_, port_);
+                DoConnect();
+            }
+        });
     }
 
     void ProcessPacket(const char* data, size_t size)
@@ -381,7 +454,8 @@ private:
                 else
                 {
                     is_connected_ = false;
-                    socket_.close();
+                    boost::system::error_code close_ec;
+                    socket_.close(close_ec);
                 }
             });
     }
@@ -389,10 +463,17 @@ private:
     boost::asio::io_context& io_context_;
     tcp::socket socket_;
     tcp::resolver::results_type endpoints_;
+    std::string host_;
+    std::string port_;
+
     std::atomic<bool> is_connected_{false};
     std::atomic<bool> connect_failed_{false};
     std::atomic<AuthStatus> auth_status_{AuthStatus::NONE};
     std::atomic<uint32_t> user_id_{0};
+
+    std::string reconnect_token_;
+    std::atomic<uint32_t> last_room_id_{0};
+    boost::asio::steady_timer reconnect_timer_{io_context_};
 
     MessageDispatcher dispatcher_;
     PacketBuffer packet_buffer_;
@@ -423,6 +504,7 @@ public:
         if (res.success)
         {
             client->SetUserId(res.assigned_user_id);
+            client->SetReconnectToken(res.reconnect_token); // 서버로부터 전달받은 재접속 토큰 저장
             client->SetAuthStatus(AuthStatus::SUCCESS);
             std::cout << "\n[System] Login Success! User ID: " << res.assigned_user_id << std::endl;
         }
@@ -526,6 +608,7 @@ public:
 
         if (res.success)
         {
+            client->SetLastRoomId(res.room_id);
             std::cout << "\n[System] Successfully joined room ID: " << res.room_id << std::endl;
         }
         else
@@ -545,6 +628,7 @@ public:
 
         if (res.success)
         {
+            client->SetLastRoomId(0);
             std::cout << "\n[System] Successfully left room." << std::endl;
         }
         else
@@ -554,7 +638,6 @@ public:
     }
 };
 
-// --- 신규 추가: 귓속말 응답 및 수신 알림 핸들러 ---
 class WhisperResponseHandler : public IMessageHandler
 {
 public:
@@ -584,6 +667,37 @@ public:
     }
 };
 
+// 재접속 응답 처리 핸들러
+class ReconnectResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(ReconnectResponse)) return;
+        const auto& res = *reinterpret_cast<const ReconnectResponse*>(data);
+
+        if (res.success)
+        {
+            client->SetLastRoomId(res.restored_room_id);
+            std::cout << "\n[System] Reconnection & session restoration successful!" << std::endl;
+            if (res.restored_room_id != 0)
+            {
+                std::cout << "[System] Restored to previous Room ID: " << res.restored_room_id << std::endl;
+            }
+            else
+            {
+                std::cout << "[System] Returned to Lobby." << std::endl;
+            }
+            std::cout << "Message: " << std::flush;
+        }
+        else
+        {
+            std::cout << "\n[System] Reconnection failed: " << res.error_message << std::endl;
+            client->SetAuthStatus(AuthStatus::FAILED);
+        }
+    }
+};
+
 // =========================================================
 // ChatClient 생성자 (핸들러 바인딩)
 // =========================================================
@@ -601,9 +715,11 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
     dispatcher_.RegisterHandler(MessageType::JOIN_ROOM_RESPONSE, std::make_unique<JoinRoomResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM_RESPONSE, std::make_unique<LeaveRoomResponseHandler>());
 
-    // --- 귓속말 핸들러 등록 ---
     dispatcher_.RegisterHandler(MessageType::WHISPER_RESPONSE, std::make_unique<WhisperResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::WHISPER_NOTIFICATION, std::make_unique<WhisperNotificationHandler>());
+
+    // 재접속 핸들러 등록
+    dispatcher_.RegisterHandler(MessageType::RECONNECT_RESPONSE, std::make_unique<ReconnectResponseHandler>());
 }
 
 // =========================================================
@@ -769,6 +885,7 @@ int main()
                     leave_req.room_id = target_room_id;
 
                     client->Send(&leave_req, sizeof(LeaveRoomRequest));
+                    client->SetLastRoomId(0);
                     std::cout << "[System] Left Room " << target_room_id << ", returning to Lobby menu..." << std::endl;
                     break;
                 }
