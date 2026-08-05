@@ -37,8 +37,8 @@ enum class MessageType : uint16_t
     WHISPER_REQUEST = 1018,
     WHISPER_RESPONSE = 1019,
     WHISPER_NOTIFICATION = 1020,
-    RECONNECT_REQUEST = 1021, // 추가
-    RECONNECT_RESPONSE = 1022 // 추가
+    RECONNECT_REQUEST = 1021,
+    RECONNECT_RESPONSE = 1022
 };
 
 #pragma pack(push, 1)
@@ -62,7 +62,7 @@ struct LoginResponse
     PacketHeader header;
     bool success;
     uint32_t assigned_user_id;
-    char reconnect_token[64]; // 재접속 토큰 발급
+    char reconnect_token[64];
     char error_message[128];
 };
 
@@ -178,30 +178,29 @@ struct WhisperNotification
     char message[512];
 };
 
-// 재접속 관련 패킷 정의
 struct ReconnectRequest
 {
     PacketHeader header;
     uint32_t user_id;
     char reconnect_token[64];
-    uint32_t last_room_id; // 클라이언트가 접속해 있던 방 ID
+    uint32_t last_room_id;
 };
 
 struct ReconnectResponse
 {
     PacketHeader header;
     bool success;
-    uint32_t restored_room_id; // 복구 완료된 방 ID (0이면 로비로)
+    uint32_t restored_room_id;
     char error_message[128];
 };
 #pragma pack(pop)
 
+// 전방 선언
 class ChatServer;
-class ChatRoom;
 class ChatSession;
 
 //=====================
-// 유저 및 관리자
+// 유저
 //=====================
 class User : public std::enable_shared_from_this<User>
 {
@@ -217,14 +216,12 @@ public:
     const std::string& GetUsername() const { return username_; }
     bool IsOnline() const { return is_online_; }
     void SetOnline(bool online) { is_online_ = online; }
-    
     void SetSession(std::shared_ptr<ChatSession> session) { session_ = session; }
     std::weak_ptr<ChatSession> GetSession() const { return session_; }
 
     void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
     const std::string& GetReconnectToken() const { return reconnect_token_; }
 
-    // 재접속 유예 타이머 시작 (60초)
     template <typename OnExpiredCallback>
     void StartDisconnectTimer(OnExpiredCallback&& on_expired)
     {
@@ -233,7 +230,7 @@ public:
             disconnect_timer_.async_wait(boost::asio::bind_executor(strand_, [this, self, cb = std::move(cb)](boost::system::error_code ec) {
                 if (!ec)
                 {
-                    cb(); // 60초 만료 시 완전히 cleanup 수행
+                    cb();
                 }
             }));
         });
@@ -257,88 +254,6 @@ private:
 
     std::string reconnect_token_;
     boost::asio::steady_timer disconnect_timer_;
-};
-
-class UserManager : public std::enable_shared_from_this<UserManager>
-{
-public:
-    explicit UserManager(boost::asio::io_context& io_context)
-        : io_context_(io_context), strand_(boost::asio::make_strand(io_context)), next_user_id_(1) {}
-
-    template <typename Callback>
-    void CreateUser(const std::string& username, uint64_t password, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), username, password, cb = std::forward<Callback>(callback)]() mutable {
-            for (const auto& [id, user] : users_) {
-                if (user->GetUsername() == username) {
-                    cb(nullptr);
-                    return;
-                }
-            }
-            uint32_t user_id = next_user_id_++;
-            auto user = std::make_shared<User>(io_context_, user_id, username);
-            user->SetPassword(password);
-            users_[user_id] = user;
-            std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
-            cb(user);
-        });
-    }
-
-    template <typename Callback>
-    void GetUserByUsername(const std::string& username, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), username, cb = std::forward<Callback>(callback)]() mutable {
-            for (const auto& [id, user] : users_) {
-                if (user->GetUsername() == username) {
-                    cb(user);
-                    return;
-                }
-            }
-            cb(nullptr);
-        });
-    }
-
-    template <typename Callback>
-    void GetUser(uint32_t user_id, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
-            auto it = users_.find(user_id);
-            cb((it != users_.end()) ? it->second : nullptr);
-        });
-    }
-
-    // 재접속 바인딩 로직
-    template <typename Callback>
-    void TryReconnect(uint32_t user_id, const std::string& token, std::shared_ptr<ChatSession> new_session, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, token, new_session, cb = std::forward<Callback>(callback)]() mutable {
-            auto it = users_.find(user_id);
-            if (it == users_.end()) {
-                cb(false, "USER_NOT_FOUND");
-                return;
-            }
-
-            auto user = it->second;
-            if (user->GetReconnectToken() != token) {
-                cb(false, "INVALID_TOKEN");
-                return;
-            }
-
-            user->CancelDisconnectTimer();
-            user->SetSession(new_session);
-            new_session->SetUserId(user_id);
-            new_session->SetAuthenticated(true);
-            user->SetOnline(true);
-
-            cb(true, "");
-        });
-    }
-
-private:
-    boost::asio::io_context& io_context_;
-    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
-    std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
-    uint32_t next_user_id_;
 };
 
 //=====================
@@ -427,6 +342,123 @@ private:
 };
 
 //=====================
+// 유저 매니저
+//=====================
+class UserManager : public std::enable_shared_from_this<UserManager>
+{
+public:
+    explicit UserManager(boost::asio::io_context& io_context)
+        : io_context_(io_context), strand_(boost::asio::make_strand(io_context)), next_user_id_(1) {}
+
+    template <typename Callback>
+    void CreateUser(const std::string& username, uint64_t password, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, password, cb = std::forward<Callback>(callback)]() mutable {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    cb(nullptr);
+                    return;
+                }
+            }
+            uint32_t user_id = next_user_id_++;
+            auto user = std::make_shared<User>(io_context_, user_id, username);
+            user->SetPassword(password);
+            users_[user_id] = user;
+            std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
+            cb(user);
+        });
+    }
+
+    template <typename Callback>
+    void GetUserByUsername(const std::string& username, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, cb = std::forward<Callback>(callback)]() mutable {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    cb(user);
+                    return;
+                }
+            }
+            cb(nullptr);
+        });
+    }
+
+    template <typename Callback>
+    void GetUser(uint32_t user_id, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
+            auto it = users_.find(user_id);
+            cb((it != users_.end()) ? it->second : nullptr);
+        });
+    }
+
+    template <typename Callback>
+    void TryReconnect(uint32_t user_id, const std::string& token, std::shared_ptr<ChatSession> new_session, Callback&& callback)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, token, new_session, cb = std::forward<Callback>(callback)]() mutable {
+            auto it = users_.find(user_id);
+            if (it == users_.end()) {
+                cb(false, "USER_NOT_FOUND");
+                return;
+            }
+
+            auto user = it->second;
+            if (user->GetReconnectToken() != token) {
+                cb(false, "INVALID_TOKEN");
+                return;
+            }
+
+            user->CancelDisconnectTimer();
+            user->SetSession(new_session);
+            cb(true, "");
+        });
+    }
+
+private:
+    boost::asio::io_context& io_context_;
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
+    uint32_t next_user_id_;
+};
+
+//=====================
+// 채팅방
+//=====================
+class ChatRoom : public std::enable_shared_from_this<ChatRoom>
+{
+public:
+    ChatRoom(boost::asio::io_context& io_context, uint32_t room_id, std::string name, uint32_t max_users)
+        : strand_(boost::asio::make_strand(io_context)), room_id_(room_id), name_(name), max_users_(max_users), current_users_(0) {}
+
+    uint32_t GetId() const { return room_id_; }
+    std::string GetName() const { return name_; }
+    uint32_t GetMaxUsers() const { return max_users_; }
+    uint32_t GetCurrentUsers() const { return current_users_.load(); }
+
+    template <typename Callback>
+    void AddUser(std::shared_ptr<User> user, Callback&& callback);
+
+    void AddUser(std::shared_ptr<User> user);
+
+    template <typename Callback>
+    void RemoveUser(uint32_t user_id, Callback&& callback);
+
+    void RemoveUser(uint32_t user_id);
+
+    void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id);
+
+    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);
+
+private:
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    uint32_t room_id_;
+    std::string name_;
+    uint32_t max_users_;
+    std::atomic<uint32_t> current_users_;
+    std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
+};
+
+//=====================
 // 세션 클래스
 //=====================
 class ChatSession : public std::enable_shared_from_this<ChatSession>
@@ -443,7 +475,19 @@ public:
         socket_.close(ec);
     }
 
-    void Start();
+    void Start()
+    {
+        ResetTimer();
+        Do_read();
+
+        PacketHeader prompt_header{};
+        prompt_header.packet_size = sizeof(PacketHeader);
+        prompt_header.message_type = MessageType::LOGIN_PROMPT;
+        prompt_header.user_id = 0;
+        prompt_header.sequence_number = 0;
+
+        SendMessage(&prompt_header, sizeof(PacketHeader));
+    }
 
     void SendMessage(const void* data, size_t size)
     {
@@ -467,8 +511,32 @@ public:
     void SetAuthenticated(bool auth) { is_authenticated_ = auth; }
     bool IsAuthenticated() const { return is_authenticated_; }
 
-    void Disconnect();
-    void ResetTimer();
+    void Disconnect(); // ChatServer 참조 때문에 하단 구현
+
+    // 중복 접속자 강제 퇴장 메서드
+    void Kick()
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this()]() {
+            if (is_disconnected_) return;
+            is_disconnected_ = true;
+
+            boost::system::error_code ec;
+            idle_timer_.cancel(ec);
+            socket_.close(ec);
+        });
+    }
+
+    void ResetTimer()
+    {
+        idle_timer_.expires_after(std::chrono::seconds(300));
+        idle_timer_.async_wait(boost::asio::bind_executor(strand_, [this, self = shared_from_this()](boost::system::error_code ec) {
+            if (!ec)
+            {
+                std::cout << "[System] Session timed out due to inactivity. User ID: " << user_id_ << '\n';
+                Disconnect();
+            }
+        }));
+    }
 
 private:
     void Do_read()
@@ -529,110 +597,87 @@ private:
     PacketBuffer packet_buffer_;
 };
 
-//=====================
-// 채팅방
-//=====================
-class ChatRoom : public std::enable_shared_from_this<ChatRoom>
+// ChatRoom 내부 함수 정의
+template <typename Callback>
+void ChatRoom::AddUser(std::shared_ptr<User> user, Callback&& callback)
 {
-public:
-    ChatRoom(boost::asio::io_context& io_context, uint32_t room_id, std::string name, uint32_t max_users)
-        : strand_(boost::asio::make_strand(io_context)), room_id_(room_id), name_(name), max_users_(max_users), current_users_(0) {}
-
-    uint32_t GetId() const { return room_id_; }
-    std::string GetName() const { return name_; }
-    uint32_t GetMaxUsers() const { return max_users_; }
-    uint32_t GetCurrentUsers() const { return current_users_.load(); }
-
-    template <typename Callback>
-    void AddUser(std::shared_ptr<User> user, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user, cb = std::forward<Callback>(callback)]() mutable {
-            auto it = users_.find(user->GetId());
-            if (it != users_.end()) {
-                // 이미 방에 있던 유저면 세션만 갱신된 셈이므로 성공 처리
-                cb(true, "");
-                return;
-            }
-
-            if (users_.size() >= max_users_) {
-                cb(false, "ROOM_FULL");
-                return;
-            }
-
-            users_[user->GetId()] = user;
-            current_users_++;
-            BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+    boost::asio::post(strand_, [this, self = shared_from_this(), user, cb = std::forward<Callback>(callback)]() mutable {
+        auto it = users_.find(user->GetId());
+        if (it != users_.end()) {
             cb(true, "");
-        });
-    }
+            return;
+        }
 
-    void AddUser(std::shared_ptr<User> user)
-    {
-        AddUser(user, [](bool, const std::string&) {});
-    }
+        if (users_.size() >= max_users_) {
+            cb(false, "ROOM_FULL");
+            return;
+        }
 
-    template <typename Callback>
-    void RemoveUser(uint32_t user_id, Callback&& callback)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
-            auto it = users_.find(user_id);
-            if (it == users_.end()) {
-                cb(false, "USER_NOT_IN_ROOM");
-                return;
-            }
-            std::string username = it->second->GetUsername();
-            users_.erase(it);
-            current_users_--;
-            BroadcastNotification(username + " left the room.", user_id);
-            cb(true, "");
-        });
-    }
+        users_[user->GetId()] = user;
+        current_users_++;
+        BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+        cb(true, "");
+    });
+}
 
-    void RemoveUser(uint32_t user_id)
-    {
-        RemoveUser(user_id, [](bool, const std::string&) {});
-    }
+inline void ChatRoom::AddUser(std::shared_ptr<User> user)
+{
+    AddUser(user, [](bool, const std::string&) {});
+}
 
-    void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
-            for (auto& [id, user] : users_)
-            {
-                if (auto session = user->GetSession().lock())
-                {
-                    session->SendMessage(&msg, sizeof(ChatMessage));
-                }
-            }
-        });
-    }
+template <typename Callback>
+void ChatRoom::RemoveUser(uint32_t user_id, Callback&& callback)
+{
+    boost::asio::post(strand_, [this, self = shared_from_this(), user_id, cb = std::forward<Callback>(callback)]() mutable {
+        auto it = users_.find(user_id);
+        if (it == users_.end()) {
+            cb(false, "USER_NOT_IN_ROOM");
+            return;
+        }
+        std::string username = it->second->GetUsername();
+        users_.erase(it);
+        current_users_--;
+        BroadcastNotification(username + " left the room.", user_id);
+        cb(true, "");
+    });
+}
 
-    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0)
-    {
-        ServerNotification notif{};
-        notif.header.packet_size = sizeof(ServerNotification);
-        notif.header.message_type = MessageType::SERVER_NOTIFICATION;
-        notif.header.user_id = 0;
-        notif.header.sequence_number = 0;
-        std::strncpy(notif.message, notification_text.c_str(), sizeof(notif.message) - 1);
+inline void ChatRoom::RemoveUser(uint32_t user_id)
+{
+    RemoveUser(user_id, [](bool, const std::string&) {});
+}
 
+inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
+{
+    boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
         for (auto& [id, user] : users_)
         {
-            if (id == except_user_id) continue;
             if (auto session = user->GetSession().lock())
             {
-                session->SendMessage(&notif, sizeof(ServerNotification));
+                session->SendMessage(&msg, sizeof(ChatMessage));
             }
         }
-    }
+    });
+}
 
-private:
-    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
-    uint32_t room_id_;
-    std::string name_;
-    uint32_t max_users_;
-    std::atomic<uint32_t> current_users_;
-    std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
-};
+inline void ChatRoom::BroadcastNotification(const std::string& notification_text, uint32_t except_user_id)
+{
+    ServerNotification notif{};
+    notif.header.packet_size = sizeof(ServerNotification);
+    notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+    notif.header.user_id = 0;
+    notif.header.sequence_number = 0;
+    std::strncpy(notif.message, notification_text.c_str(), sizeof(notif.message) - 1);
+
+    for (auto& [id, user] : users_)
+    {
+        if (id == except_user_id) continue;
+        if (auto session = user->GetSession().lock())
+        {
+            session->SendMessage(&notif, sizeof(ServerNotification));
+        }
+    }
+}
 
 //=====================
 // 서버 클래스
@@ -640,7 +685,7 @@ private:
 class ChatServer : public std::enable_shared_from_this<ChatServer>
 {
 public:
-    ChatServer(boost::asio::io_context& io_context, short port);
+    ChatServer(boost::asio::io_context& io_context, short port); // 핸들러 의존으로 아래에서 구현
 
     boost::asio::io_context& GetIOContext() { return io_context_; }
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
@@ -657,7 +702,6 @@ public:
                 user->SetOnline(false);
                 std::cout << "[System] User connection lost (Grace period 60s started). User ID: " << user_id << std::endl;
 
-                // 60초 유예 타이머 시작: 시간 내 재접속 안 하면 완전히 방에서 내보냄
                 user->StartDisconnectTimer([this, self, user_id]() {
                     boost::asio::post(strand_, [this, self, user_id]() {
                         for (auto& [id, room] : rooms_) room->RemoveUser(user_id);
@@ -736,21 +780,7 @@ private:
     uint32_t next_room_id_ = 1;
 };
 
-void ChatSession::Start()
-{
-    ResetTimer();
-    Do_read();
-
-    PacketHeader prompt_header{};
-    prompt_header.packet_size = sizeof(PacketHeader);
-    prompt_header.message_type = MessageType::LOGIN_PROMPT;
-    prompt_header.user_id = 0;
-    prompt_header.sequence_number = 0;
-
-    SendMessage(&prompt_header, sizeof(PacketHeader));
-}
-
-void ChatSession::Disconnect()
+inline void ChatSession::Disconnect()
 {
     if (is_disconnected_) return;
     is_disconnected_ = true;
@@ -761,27 +791,15 @@ void ChatSession::Disconnect()
     server_.OnSessionDisconnected(shared_from_this());
 }
 
-void ChatSession::ProcessPacket(const char* data, size_t size)
+inline void ChatSession::ProcessPacket(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
     server_.GetDispatcher().DispatchMessage(shared_from_this(), header, data, size);
 }
 
-void ChatSession::ResetTimer()
-{
-    idle_timer_.expires_after(std::chrono::seconds(300));
-    idle_timer_.async_wait(boost::asio::bind_executor(strand_, [this, self = shared_from_this()](boost::system::error_code ec) {
-        if (!ec)
-        {
-            std::cout << "[System] Session timed out due to inactivity. User ID: " << user_id_ << '\n';
-            Disconnect();
-        }
-    }));
-}
-
 //=====================
-// 메시지 핸들러 구현부
+// 메시지 핸들러 (모든 본문을 클래스 {} 내부로 이동)
 //=====================
 class ReconnectHandler : public IMessageHandler
 {
@@ -798,7 +816,6 @@ public:
         std::string token = req.reconnect_token;
         uint32_t last_room_id = req.last_room_id;
 
-        // 1. 토큰 검증 및 유저 세션 바인딩
         user_manager_.TryReconnect(user_id, token, session, [this, session, user_id, last_room_id](bool success, const std::string& err) {
             ReconnectResponse res{};
             res.header.message_type = MessageType::RECONNECT_RESPONSE;
@@ -812,9 +829,12 @@ public:
                 return;
             }
 
-            // 2. 재접속 성공 시 클라이언트가 알려준 마지막 방으로 복구
             user_manager_.GetUser(user_id, [this, session, res, last_room_id](std::shared_ptr<User> user) mutable {
                 if (!user) return;
+
+                user->SetOnline(true);
+                session->SetUserId(user->GetId());
+                session->SetAuthenticated(true);
 
                 server_.GetRoom(last_room_id, [session, user, res, last_room_id](std::shared_ptr<ChatRoom> room) mutable {
                     if (room)
@@ -827,7 +847,6 @@ public:
                     }
                     else
                     {
-                        // 방이 폭파된 경우
                         res.success = true;
                         res.restored_room_id = 0;
                         session->SendMessage(&res, sizeof(ReconnectResponse));
@@ -923,13 +942,35 @@ public:
                 response.success = false;
                 std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
                 std::cout << "[Login Fail] User not found: " << username << std::endl;
+                session->SendMessage(&response, sizeof(LoginResponse));
             }
             else if (existing_user->GetPassword() == pass)
             {
+                // =========================================================
+                // 중복 로그인(Dual Login) 방지 및 이전 세션 처리
+                // =========================================================
+                if (existing_user->IsOnline())
+                {
+                    if (auto old_session = existing_user->GetSession().lock())
+                    {
+                        std::cout << "[Login] Dual login detected for user: " << username 
+                                  << ". Kicking old session." << std::endl;
+
+                        ServerNotification kick_notif{};
+                        kick_notif.header.packet_size = sizeof(ServerNotification);
+                        kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+                        std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
+                        old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
+
+                        old_session->Kick();
+                    }
+
+                    existing_user->CancelDisconnectTimer();
+                }
+
                 existing_user->SetSession(session);
                 existing_user->SetOnline(true);
-                
-                // 간단한 임시 토큰 생성
+
                 std::string token = "TOKEN_" + std::to_string(existing_user->GetId()) + "_SECRET";
                 existing_user->SetReconnectToken(token);
                 std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
@@ -944,15 +985,16 @@ public:
                 server.GetRoom(1, [existing_user](std::shared_ptr<ChatRoom> lobby) {
                     if (lobby) lobby->AddUser(existing_user);
                 });
+
+                session->SendMessage(&response, sizeof(LoginResponse));
             }
             else
             {
                 response.success = false;
                 std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
                 std::cout << "[Login Fail] Incorrect password for: " << username << std::endl;
+                session->SendMessage(&response, sizeof(LoginResponse));
             }
-
-            session->SendMessage(&response, sizeof(LoginResponse));
         });
     }
 
@@ -1193,10 +1235,8 @@ private:
     ChatServer& server_;
 };
 
-//=====================
-// 서버 생성자
-//=====================
-ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
+// ChatServer 생성자 구현 (모든 핸들러 클래스 선언 후)
+inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     : io_context_(io_context),
       strand_(boost::asio::make_strand(io_context)),
       acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
@@ -1210,11 +1250,14 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::JOIN_ROOM, std::make_unique<JoinRoomHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
-    dispatcher_.RegisterHandler(MessageType::RECONNECT_REQUEST, std::make_unique<ReconnectHandler>(*user_manager_, *this)); // 핸들러 등록
+    dispatcher_.RegisterHandler(MessageType::RECONNECT_REQUEST, std::make_unique<ReconnectHandler>(*user_manager_, *this));
 
     do_accept();
 }
 
+//=====================
+// 진입점
+//=====================
 int main()
 {
     try
