@@ -13,6 +13,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <functional>
 
 using boost::asio::ip::tcp;
 using boost::asio::awaitable;
@@ -228,7 +229,7 @@ public:
     void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
     const std::string& GetReconnectToken() const { return reconnect_token_; }
 
-    // 코루틴 기반 연결 해제 타이머
+    // 비동기 타이머I/O는 코루틴 활용
     template <typename OnExpiredCallback>
     void StartDisconnectTimer(OnExpiredCallback&& on_expired)
     {
@@ -314,13 +315,13 @@ private:
 };
 
 //=====================
-// 디스패처 인터페이스 (코루틴화)
+// 디스패처 인터페이스 (콜백 기반으로 변경)
 //=====================
 class IMessageHandler
 {
 public:
     virtual ~IMessageHandler() = default;
-    virtual awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) = 0;
+    virtual void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) = 0;
 };
 
 class MessageDispatcher
@@ -331,12 +332,12 @@ public:
         handlers_[type] = std::move(handler);
     }
 
-    awaitable<void> DispatchMessage(std::shared_ptr<ChatSession> session, const PacketHeader& header, const char* data, size_t size)
+    void DispatchMessage(std::shared_ptr<ChatSession> session, const PacketHeader& header, const char* data, size_t size)
     {
         auto it = handlers_.find(header.message_type);
         if (it != handlers_.end())
         {
-            co_await it->second->HandleMessage(session, data, size);
+            it->second->HandleMessage(session, data, size);
         }
         else
         {
@@ -349,7 +350,7 @@ private:
 };
 
 //=====================
-// 유저 매니저
+// 유저 매니저 (내부 로직은 Strand 동기화 기반 일반 함수로 전환)
 //=====================
 class UserManager : public std::enable_shared_from_this<UserManager>
 {
@@ -357,60 +358,65 @@ public:
     explicit UserManager(boost::asio::io_context& io_context)
         : io_context_(io_context), strand_(boost::asio::make_strand(io_context)), next_user_id_(1) {}
 
-    awaitable<std::shared_ptr<User>> CreateUser(std::string username, uint64_t password)
+    void CreateUser(const std::string& username, uint64_t password, std::function<void(std::shared_ptr<User>)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        for (const auto& [id, user] : users_) {
-            if (user->GetUsername() == username) {
-                co_return nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, password, callback]() {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    callback(nullptr);
+                    return;
+                }
             }
-        }
-        uint32_t user_id = next_user_id_++;
-        auto user = std::make_shared<User>(io_context_, user_id, username);
-        user->SetPassword(password);
-        users_[user_id] = user;
-        std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
-        co_return user;
+            uint32_t user_id = next_user_id_++;
+            auto user = std::make_shared<User>(io_context_, user_id, username);
+            user->SetPassword(password);
+            users_[user_id] = user;
+            std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
+            callback(user);
+        });
     }
 
-    awaitable<std::shared_ptr<User>> GetUserByUsername(std::string username)
+    void GetUserByUsername(const std::string& username, std::function<void(std::shared_ptr<User>)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        for (const auto& [id, user] : users_) {
-            if (user->GetUsername() == username) {
-                co_return user;
+        boost::asio::post(strand_, [this, self = shared_from_this(), username, callback]() {
+            for (const auto& [id, user] : users_) {
+                if (user->GetUsername() == username) {
+                    callback(user);
+                    return;
+                }
             }
-        }
-        co_return nullptr;
+            callback(nullptr);
+        });
     }
 
-    awaitable<std::shared_ptr<User>> GetUser(uint32_t user_id)
+    void GetUser(uint32_t user_id, std::function<void(std::shared_ptr<User>)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        auto it = users_.find(user_id);
-        co_return (it != users_.end()) ? it->second : nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, callback]() {
+            auto it = users_.find(user_id);
+            callback((it != users_.end()) ? it->second : nullptr);
+        });
     }
 
-    awaitable<std::pair<bool, std::string>> TryReconnect(uint32_t user_id, std::string token, std::shared_ptr<ChatSession> new_session)
+    void TryReconnect(uint32_t user_id, const std::string& token, std::shared_ptr<ChatSession> new_session,
+                      std::function<void(bool, const std::string&)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, token, new_session, callback]() {
+            auto it = users_.find(user_id);
+            if (it == users_.end()) {
+                callback(false, "USER_NOT_FOUND");
+                return;
+            }
 
-        auto it = users_.find(user_id);
-        if (it == users_.end()) {
-            co_return std::make_pair(false, "USER_NOT_FOUND");
-        }
+            auto user = it->second;
+            if (user->GetReconnectToken() != token) {
+                callback(false, "INVALID_TOKEN");
+                return;
+            }
 
-        auto user = it->second;
-        if (user->GetReconnectToken() != token) {
-            co_return std::make_pair(false, "INVALID_TOKEN");
-        }
-
-        user->CancelDisconnectTimer();
-        user->SetSession(new_session);
-        co_return std::make_pair(true, "");
+            user->CancelDisconnectTimer();
+            user->SetSession(new_session);
+            callback(true, "");
+        });
     }
 
 private:
@@ -434,38 +440,41 @@ public:
     uint32_t GetMaxUsers() const { return max_users_; }
     uint32_t GetCurrentUsers() const { return current_users_.load(); }
 
-    awaitable<std::pair<bool, std::string>> AddUser(std::shared_ptr<User> user)
+    void AddUser(std::shared_ptr<User> user, std::function<void(bool, const std::string&)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
+        boost::asio::post(strand_, [this, self = shared_from_this(), user, callback]() {
+            auto it = users_.find(user->GetId());
+            if (it != users_.end()) {
+                if (callback) callback(true, "");
+                return;
+            }
 
-        auto it = users_.find(user->GetId());
-        if (it != users_.end()) {
-            co_return std::make_pair(true, "");
-        }
+            if (users_.size() >= max_users_) {
+                if (callback) callback(false, "ROOM_FULL");
+                return;
+            }
 
-        if (users_.size() >= max_users_) {
-            co_return std::make_pair(false, "ROOM_FULL");
-        }
-
-        users_[user->GetId()] = user;
-        current_users_++;
-        BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
-        co_return std::make_pair(true, "");
+            users_[user->GetId()] = user;
+            current_users_++;
+            BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
+            if (callback) callback(true, "");
+        });
     }
 
-    awaitable<std::pair<bool, std::string>> RemoveUser(uint32_t user_id)
+    void RemoveUser(uint32_t user_id, std::function<void(bool, const std::string&)> callback = nullptr)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        auto it = users_.find(user_id);
-        if (it == users_.end()) {
-            co_return std::make_pair(false, "USER_NOT_IN_ROOM");
-        }
-        std::string username = it->second->GetUsername();
-        users_.erase(it);
-        current_users_--;
-        BroadcastNotification(username + " left the room.", user_id);
-        co_return std::make_pair(true, "");
+        boost::asio::post(strand_, [this, self = shared_from_this(), user_id, callback]() {
+            auto it = users_.find(user_id);
+            if (it == users_.end()) {
+                if (callback) callback(false, "USER_NOT_IN_ROOM");
+                return;
+            }
+            std::string username = it->second->GetUsername();
+            users_.erase(it);
+            current_users_--;
+            BroadcastNotification(username + " left the room.", user_id);
+            if (callback) callback(true, "");
+        });
     }
 
     void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id);
@@ -481,7 +490,7 @@ private:
 };
 
 //=====================
-// 세션 클래스 (코루틴 기반 메시지 루프)
+// 세션 클래스 (네트워크 I/O 루프는 코루틴 유지)
 //=====================
 class ChatSession : public std::enable_shared_from_this<ChatSession>
 {
@@ -501,7 +510,6 @@ public:
     {
         co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
             StartIdleTimer();
-            
             PacketHeader prompt_header{};
             prompt_header.packet_size = sizeof(PacketHeader);
             prompt_header.message_type = MessageType::LOGIN_PROMPT;
@@ -573,7 +581,6 @@ private:
                 }
                 else if (ec == boost::asio::error::operation_aborted)
                 {
-                    // 타이머 리셋 요청 시 루프 계속 진행
                     continue;
                 }
                 else
@@ -592,12 +599,11 @@ private:
             {
                 size_t length = co_await socket_.async_read_some(boost::asio::buffer(read_buffer_), use_awaitable);
                 ResetTimer();
-                
                 packet_buffer_.WriteData(read_buffer_.data(), length);
                 std::vector<char> packet_data;
                 while (packet_buffer_.ReadPacket(packet_data))
                 {
-                    co_await ProcessPacket(packet_data.data(), packet_data.size());
+                    ProcessPacket(packet_data.data(), packet_data.size());
                 }
             }
         }
@@ -624,7 +630,7 @@ private:
         }
     }
 
-    awaitable<void> ProcessPacket(const char* data, size_t size);
+    void ProcessPacket(const char* data, size_t size);
 
     boost::asio::strand<boost::asio::any_io_executor> strand_;
     tcp::socket socket_;
@@ -688,34 +694,33 @@ public:
         uint32_t user_id = session->GetUserId();
         if (user_id == 0) return;
 
-        co_spawn(strand_, [this, self = shared_from_this(), user_id]() -> awaitable<void> {
-            auto user = co_await user_manager_->GetUser(user_id);
+        user_manager_->GetUser(user_id, [this, self = shared_from_this(), user_id](std::shared_ptr<User> user) {
             if (user)
             {
                 user->SetOnline(false);
                 std::cout << "[System] User connection lost (Grace period 60s started). User ID: " << user_id << std::endl;
 
                 user->StartDisconnectTimer([this, self, user_id]() {
-                    co_spawn(strand_, [this, self, user_id]() -> awaitable<void> {
+                    boost::asio::post(strand_, [this, self, user_id]() {
                         for (auto& [id, room] : rooms_) {
-                            co_await room->RemoveUser(user_id);
+                            room->RemoveUser(user_id);
                         }
                         std::cout << "[System] User disconnect grace period expired. Removed from all rooms ID: " << user_id << std::endl;
-                    }, detached);
+                    });
                 });
             }
-        }, detached);
+        });
     }
 
-    awaitable<uint32_t> CreateRoom(std::string name, uint32_t max_users)
+    void CreateRoom(const std::string& name, uint32_t max_users, std::function<void(uint32_t)> callback = nullptr)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        uint32_t new_room_id = next_room_id_++;
-        auto new_room = std::make_shared<ChatRoom>(io_context_, new_room_id, name, max_users);
-        rooms_[new_room_id] = new_room;
-        std::cout << "[Server] Room Created: " << name << " (ID: " << new_room_id << ")" << std::endl;
-        co_return new_room_id;
+        boost::asio::post(strand_, [this, self = shared_from_this(), name, max_users, callback]() {
+            uint32_t new_room_id = next_room_id_++;
+            auto new_room = std::make_shared<ChatRoom>(io_context_, new_room_id, name, max_users);
+            rooms_[new_room_id] = new_room;
+            std::cout << "[Server] Room Created: " << name << " (ID: " << new_room_id << ")" << std::endl;
+            if (callback) callback(new_room_id);
+        });
     }
 
     void CreateRoom(uint32_t room_id, const std::string& name, uint32_t max_users)
@@ -729,29 +734,29 @@ public:
         });
     }
 
-    awaitable<std::vector<RoomInfo>> GetRoomList()
+    void GetRoomList(std::function<void(const std::vector<RoomInfo>&)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        std::vector<RoomInfo> room_list;
-        for (const auto& [id, room] : rooms_)
-        {
-            RoomInfo info{};
-            info.room_id = room->GetId();
-            std::strncpy(info.room_name, room->GetName().c_str(), sizeof(info.room_name) - 1);
-            info.current_users = room->GetCurrentUsers();
-            info.max_users = room->GetMaxUsers();
-            room_list.push_back(info);
-        }
-        co_return room_list;
+        boost::asio::post(strand_, [this, self = shared_from_this(), callback]() {
+            std::vector<RoomInfo> room_list;
+            for (const auto& [id, room] : rooms_)
+            {
+                RoomInfo info{};
+                info.room_id = room->GetId();
+                std::strncpy(info.room_name, room->GetName().c_str(), sizeof(info.room_name) - 1);
+                info.current_users = room->GetCurrentUsers();
+                info.max_users = room->GetMaxUsers();
+                room_list.push_back(info);
+            }
+            callback(room_list);
+        });
     }
 
-    awaitable<std::shared_ptr<ChatRoom>> GetRoom(uint32_t room_id)
+    void GetRoom(uint32_t room_id, std::function<void(std::shared_ptr<ChatRoom>)> callback)
     {
-        co_await boost::asio::post(strand_, use_awaitable);
-
-        auto it = rooms_.find(room_id);
-        co_return (it != rooms_.end()) ? it->second : nullptr;
+        boost::asio::post(strand_, [this, self = shared_from_this(), room_id, callback]() {
+            auto it = rooms_.find(room_id);
+            callback((it != rooms_.end()) ? it->second : nullptr);
+        });
     }
 
     void StartAccept()
@@ -786,15 +791,15 @@ inline void ChatSession::Disconnect()
     server_.OnSessionDisconnected(shared_from_this());
 }
 
-inline awaitable<void> ChatSession::ProcessPacket(const char* data, size_t size)
+inline void ChatSession::ProcessPacket(const char* data, size_t size)
 {
-    if (size < sizeof(PacketHeader)) co_return;
+    if (size < sizeof(PacketHeader)) return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
-    co_await server_.GetDispatcher().DispatchMessage(shared_from_this(), header, data, size);
+    server_.GetDispatcher().DispatchMessage(shared_from_this(), header, data, size);
 }
 
 //=====================
-// 코루틴 메시지 핸들러 구현
+// 일반 핸들러 구현 (콜백 패턴 기반)
 //=====================
 class ReconnectHandler : public IMessageHandler
 {
@@ -802,50 +807,54 @@ public:
     ReconnectHandler(UserManager& user_manager, ChatServer& server)
         : user_manager_(user_manager), server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (size < sizeof(ReconnectRequest)) co_return;
+        if (size < sizeof(ReconnectRequest)) return;
         const auto& req = *reinterpret_cast<const ReconnectRequest*>(data);
 
         uint32_t user_id = req.user_id;
         std::string token = req.reconnect_token;
         uint32_t last_room_id = req.last_room_id;
 
-        auto [success, err] = co_await user_manager_.TryReconnect(user_id, token, session);
+        user_manager_.TryReconnect(user_id, token, session,
+            [this, session, user_id, last_room_id](bool success, const std::string& err) {
+                ReconnectResponse res{};
+                res.header.message_type = MessageType::RECONNECT_RESPONSE;
+                res.header.packet_size = sizeof(ReconnectResponse);
 
-        ReconnectResponse res{};
-        res.header.message_type = MessageType::RECONNECT_RESPONSE;
-        res.header.packet_size = sizeof(ReconnectResponse);
+                if (!success)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(ReconnectResponse));
+                    return;
+                }
 
-        if (!success)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
-            session->SendMessage(&res, sizeof(ReconnectResponse));
-            co_return;
-        }
+                user_manager_.GetUser(user_id, [this, session, last_room_id, res](std::shared_ptr<User> user) mutable {
+                    if (!user) return;
 
-        auto user = co_await user_manager_.GetUser(user_id);
-        if (!user) co_return;
+                    user->SetOnline(true);
+                    session->SetUserId(user->GetId());
+                    session->SetAuthenticated(true);
 
-        user->SetOnline(true);
-        session->SetUserId(user->GetId());
-        session->SetAuthenticated(true);
-
-        auto room = co_await server_.GetRoom(last_room_id);
-        if (room)
-        {
-            auto [joined, join_err] = co_await room->AddUser(user);
-            res.success = true;
-            res.restored_room_id = joined ? last_room_id : 0;
-        }
-        else
-        {
-            res.success = true;
-            res.restored_room_id = 0;
-        }
-
-        session->SendMessage(&res, sizeof(ReconnectResponse));
+                    server_.GetRoom(last_room_id, [session, user, last_room_id, res](std::shared_ptr<ChatRoom> room) mutable {
+                        if (room)
+                        {
+                            room->AddUser(user, [session, last_room_id, res](bool joined, const std::string&) mutable {
+                                res.success = true;
+                                res.restored_room_id = joined ? last_room_id : 0;
+                                session->SendMessage(&res, sizeof(ReconnectResponse));
+                            });
+                        }
+                        else
+                        {
+                            res.success = true;
+                            res.restored_room_id = 0;
+                            session->SendMessage(&res, sizeof(ReconnectResponse));
+                        }
+                    });
+                });
+            });
     }
 
 private:
@@ -858,23 +867,23 @@ class CreateRoomHandler : public IMessageHandler
 public:
     explicit CreateRoomHandler(ChatServer& server) : server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(CreateRoomRequest)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(CreateRoomRequest)) return;
         const auto& req = *reinterpret_cast<const CreateRoomRequest*>(data);
 
         std::string room_name = req.room_name;
         uint32_t max_users = req.max_users;
 
-        uint32_t created_room_id = co_await server_.CreateRoom(room_name, max_users);
+        server_.CreateRoom(room_name, max_users, [session](uint32_t created_room_id) {
+            CreateRoomResponse res{};
+            res.header.message_type = MessageType::CREATE_ROOM_RESPONSE;
+            res.header.packet_size = sizeof(CreateRoomResponse);
+            res.success = true;
+            res.created_room_id = created_room_id;
 
-        CreateRoomResponse res{};
-        res.header.message_type = MessageType::CREATE_ROOM_RESPONSE;
-        res.header.packet_size = sizeof(CreateRoomResponse);
-        res.success = true;
-        res.created_room_id = created_room_id;
-
-        session->SendMessage(&res, sizeof(CreateRoomResponse));
+            session->SendMessage(&res, sizeof(CreateRoomResponse));
+        });
     }
 
 private:
@@ -886,23 +895,23 @@ class RoomListHandler : public IMessageHandler
 public:
     explicit RoomListHandler(ChatServer& server) : server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(RoomListRequest)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(RoomListRequest)) return;
 
-        auto list = co_await server_.GetRoomList();
+        server_.GetRoomList([session](const std::vector<RoomInfo>& list) {
+            RoomListResponse res{};
+            res.header.message_type = MessageType::ROOM_LIST_RESPONSE;
+            res.header.packet_size = sizeof(RoomListResponse);
+            res.room_count = static_cast<uint32_t>(std::min(list.size(), size_t(16)));
 
-        RoomListResponse res{};
-        res.header.message_type = MessageType::ROOM_LIST_RESPONSE;
-        res.header.packet_size = sizeof(RoomListResponse);
-        res.room_count = static_cast<uint32_t>(std::min(list.size(), size_t(16)));
+            for (size_t i = 0; i < res.room_count; ++i)
+            {
+                res.rooms[i] = list[i];
+            }
 
-        for (size_t i = 0; i < res.room_count; ++i)
-        {
-            res.rooms[i] = list[i];
-        }
-
-        session->SendMessage(&res, sizeof(RoomListResponse));
+            session->SendMessage(&res, sizeof(RoomListResponse));
+        });
     }
 
 private:
@@ -915,75 +924,75 @@ public:
     LoginHandler(UserManager& user_manager, ChatServer& server)
         : user_manager_(user_manager), server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (size < sizeof(LoginRequest)) co_return;
+        if (size < sizeof(LoginRequest)) return;
         const auto& request = *reinterpret_cast<const LoginRequest*>(data);
 
         std::string username = request.username;
         uint64_t pass = 0;
         try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
 
-        auto existing_user = co_await user_manager_.GetUserByUsername(username);
+        user_manager_.GetUserByUsername(username, [this, session, username, pass](std::shared_ptr<User> existing_user) {
+            LoginResponse response{};
+            response.header.message_type = MessageType::LOGIN_RESPONSE;
+            response.header.packet_size = sizeof(LoginResponse);
 
-        LoginResponse response{};
-        response.header.message_type = MessageType::LOGIN_RESPONSE;
-        response.header.packet_size = sizeof(LoginResponse);
-
-        if (!existing_user)
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
-            std::cout << "[Login Fail] User not found: " << username << std::endl;
-            session->SendMessage(&response, sizeof(LoginResponse));
-        }
-        else if (existing_user->GetPassword() == pass)
-        {
-            if (existing_user->IsOnline())
+            if (!existing_user)
             {
-                if (auto old_session = existing_user->GetSession().lock())
+                response.success = false;
+                std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
+                std::cout << "[Login Fail] User not found: " << username << std::endl;
+                session->SendMessage(&response, sizeof(LoginResponse));
+            }
+            else if (existing_user->GetPassword() == pass)
+            {
+                if (existing_user->IsOnline())
                 {
-                    std::cout << "[Login] Dual login detected for user: " << username 
-                              << ". Kicking old session." << std::endl;
+                    if (auto old_session = existing_user->GetSession().lock())
+                    {
+                        std::cout << "[Login] Dual login detected for user: " << username 
+                                  << ". Kicking old session." << std::endl;
 
-                    ServerNotification kick_notif{};
-                    kick_notif.header.packet_size = sizeof(ServerNotification);
-                    kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
-                    std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
-                    old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
+                        ServerNotification kick_notif{};
+                        kick_notif.header.packet_size = sizeof(ServerNotification);
+                        kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+                        std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
+                        old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
 
-                    old_session->Kick();
+                        old_session->Kick();
+                    }
+
+                    existing_user->CancelDisconnectTimer();
                 }
 
-                existing_user->CancelDisconnectTimer();
+                existing_user->SetSession(session);
+                existing_user->SetOnline(true);
+
+                std::string token = "TOKEN_" + std::to_string(existing_user->GetId()) + "_SECRET";
+                existing_user->SetReconnectToken(token);
+                std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
+
+                session->SetUserId(existing_user->GetId());
+                session->SetAuthenticated(true);
+
+                response.success = true;
+                response.assigned_user_id = existing_user->GetId();
+                std::cout << "[Login Success] User: " << username << " (ID: " << existing_user->GetId() << ")" << std::endl;
+
+                server_.GetRoom(1, [existing_user, response, session](std::shared_ptr<ChatRoom> lobby) mutable {
+                    if (lobby) lobby->AddUser(existing_user, nullptr);
+                    session->SendMessage(&response, sizeof(LoginResponse));
+                });
             }
-
-            existing_user->SetSession(session);
-            existing_user->SetOnline(true);
-
-            std::string token = "TOKEN_" + std::to_string(existing_user->GetId()) + "_SECRET";
-            existing_user->SetReconnectToken(token);
-            std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
-
-            session->SetUserId(existing_user->GetId());
-            session->SetAuthenticated(true);
-
-            response.success = true;
-            response.assigned_user_id = existing_user->GetId();
-            std::cout << "[Login Success] User: " << username << " (ID: " << existing_user->GetId() << ")" << std::endl;
-
-            auto lobby = co_await server_.GetRoom(1);
-            if (lobby) co_await lobby->AddUser(existing_user);
-
-            session->SendMessage(&response, sizeof(LoginResponse));
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
-            std::cout << "[Login Fail] Incorrect password for: " << username << std::endl;
-            session->SendMessage(&response, sizeof(LoginResponse));
-        }
+            else
+            {
+                response.success = false;
+                std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
+                std::cout << "[Login Fail] Incorrect password for: " << username << std::endl;
+                session->SendMessage(&response, sizeof(LoginResponse));
+            }
+        });
     }
 
 private:
@@ -996,34 +1005,34 @@ class RegisterHandler : public IMessageHandler
 public:
     explicit RegisterHandler(UserManager& user_manager) : user_manager_(user_manager) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (size < sizeof(RegisterRequest)) co_return;
+        if (size < sizeof(RegisterRequest)) return;
         const auto& request = *reinterpret_cast<const RegisterRequest*>(data);
 
         std::string username = request.username;
         uint64_t pass = 0;
         try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
 
-        auto new_user = co_await user_manager_.CreateUser(username, pass);
+        user_manager_.CreateUser(username, pass, [session, username](std::shared_ptr<User> new_user) {
+            RegisterResponse response{};
+            response.header.message_type = MessageType::REGISTER_RESPONSE;
+            response.header.packet_size = sizeof(RegisterResponse);
 
-        RegisterResponse response{};
-        response.header.message_type = MessageType::REGISTER_RESPONSE;
-        response.header.packet_size = sizeof(RegisterResponse);
+            if (new_user)
+            {
+                response.success = true;
+                response.assigned_user_id = new_user->GetId();
+                std::cout << "[Register Success] New User Created: " << username << " (ID: " << new_user->GetId() << ")" << std::endl;
+            }
+            else
+            {
+                response.success = false;
+                std::strncpy(response.error_message, "Username already exists.", sizeof(response.error_message) - 1);
+            }
 
-        if (new_user)
-        {
-            response.success = true;
-            response.assigned_user_id = new_user->GetId();
-            std::cout << "[Register Success] New User Created: " << username << " (ID: " << new_user->GetId() << ")" << std::endl;
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "Username already exists.", sizeof(response.error_message) - 1);
-        }
-
-        session->SendMessage(&response, sizeof(RegisterResponse));
+            session->SendMessage(&response, sizeof(RegisterResponse));
+        });
     }
 
 private:
@@ -1035,16 +1044,17 @@ class ChatMessageHandler : public IMessageHandler
 public:
     explicit ChatMessageHandler(ChatServer& server) : server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        auto room = co_await server_.GetRoom(message.room_id);
-        if (room)
-        {
-            room->BroadcastMessage(message, session->GetUserId());
-        }
+        server_.GetRoom(message.room_id, [message, session](std::shared_ptr<ChatRoom> room) {
+            if (room)
+            {
+                room->BroadcastMessage(message, session->GetUserId());
+            }
+        });
     }
 
 private:
@@ -1057,43 +1067,45 @@ public:
     JoinRoomHandler(UserManager& user_manager, ChatServer& server)
         : user_manager_(user_manager), server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(JoinRoomRequest)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(JoinRoomRequest)) return;
         const auto& req = *reinterpret_cast<const JoinRoomRequest*>(data);
 
         uint32_t user_id = session->GetUserId();
         uint32_t target_room_id = req.room_id;
 
-        auto user = co_await user_manager_.GetUser(user_id);
-        if (!user) co_return;
+        user_manager_.GetUser(user_id, [this, session, target_room_id, user_id](std::shared_ptr<User> user) {
+            if (!user) return;
 
-        auto room = co_await server_.GetRoom(target_room_id);
+            server_.GetRoom(target_room_id, [session, user, target_room_id, user_id](std::shared_ptr<ChatRoom> room) {
+                JoinRoomResponse res{};
+                res.header.message_type = MessageType::JOIN_ROOM_RESPONSE;
+                res.header.packet_size = sizeof(JoinRoomResponse);
+                res.room_id = target_room_id;
 
-        JoinRoomResponse res{};
-        res.header.message_type = MessageType::JOIN_ROOM_RESPONSE;
-        res.header.packet_size = sizeof(JoinRoomResponse);
-        res.room_id = target_room_id;
+                if (!room)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(JoinRoomResponse));
+                    return;
+                }
 
-        if (!room)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
-            session->SendMessage(&res, sizeof(JoinRoomResponse));
-            co_return;
-        }
-
-        auto [success, err] = co_await room->AddUser(user);
-        res.success = success;
-        if (!success)
-        {
-            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
-        }
-        else
-        {
-            std::cout << "[Room] User " << user_id << " joined room " << target_room_id << std::endl;
-        }
-        session->SendMessage(&res, sizeof(JoinRoomResponse));
+                room->AddUser(user, [session, res, target_room_id, user_id](bool success, const std::string& err) mutable {
+                    res.success = success;
+                    if (!success)
+                    {
+                        std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                    }
+                    else
+                    {
+                        std::cout << "[Room] User " << user_id << " joined room " << target_room_id << std::endl;
+                    }
+                    session->SendMessage(&res, sizeof(JoinRoomResponse));
+                });
+            });
+        });
     }
 
 private:
@@ -1106,39 +1118,40 @@ class LeaveRoomHandler : public IMessageHandler
 public:
     explicit LeaveRoomHandler(ChatServer& server) : server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(LeaveRoomRequest)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(LeaveRoomRequest)) return;
         const auto& req = *reinterpret_cast<const LeaveRoomRequest*>(data);
 
         uint32_t user_id = session->GetUserId();
         uint32_t target_room_id = req.room_id;
 
-        auto room = co_await server_.GetRoom(target_room_id);
+        server_.GetRoom(target_room_id, [session, user_id](std::shared_ptr<ChatRoom> room) {
+            LeaveRoomResponse res{};
+            res.header.message_type = MessageType::LEAVE_ROOM_RESPONSE;
+            res.header.packet_size = sizeof(LeaveRoomResponse);
 
-        LeaveRoomResponse res{};
-        res.header.message_type = MessageType::LEAVE_ROOM_RESPONSE;
-        res.header.packet_size = sizeof(LeaveRoomResponse);
+            if (!room)
+            {
+                res.success = false;
+                std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                session->SendMessage(&res, sizeof(LeaveRoomResponse));
+                return;
+            }
 
-        if (!room)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
-            session->SendMessage(&res, sizeof(LeaveRoomResponse));
-            co_return;
-        }
-
-        auto [success, err] = co_await room->RemoveUser(user_id);
-        res.success = success;
-        if (!success)
-        {
-            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
-        }
-        else
-        {
-            std::cout << "[Room] User " << user_id << " left room " << room->GetId() << std::endl;
-        }
-        session->SendMessage(&res, sizeof(LeaveRoomResponse));
+            room->RemoveUser(user_id, [session, res, room, user_id](bool success, const std::string& err) mutable {
+                res.success = success;
+                if (!success)
+                {
+                    std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+                }
+                else
+                {
+                    std::cout << "[Room] User " << user_id << " left room " << room->GetId() << std::endl;
+                }
+                session->SendMessage(&res, sizeof(LeaveRoomResponse));
+            });
+        });
     }
 
 private:
@@ -1151,9 +1164,9 @@ public:
     WhisperHandler(UserManager& user_manager, ChatServer& server)
         : user_manager_(user_manager), server_(server) {}
 
-    awaitable<void> HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    void HandleMessage(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
-        if (!session->IsAuthenticated() || size < sizeof(WhisperRequest)) co_return;
+        if (!session->IsAuthenticated() || size < sizeof(WhisperRequest)) return;
         const auto& req = *reinterpret_cast<const WhisperRequest*>(data);
 
         uint32_t sender_id = session->GetUserId();
@@ -1161,56 +1174,57 @@ public:
         std::string message = req.message;
         uint32_t room_id = req.room_id;
 
-        auto sender_user = co_await user_manager_.GetUser(sender_id);
-        if (!sender_user) co_return;
+        user_manager_.GetUser(sender_id, [this, session, target_username, message, room_id](std::shared_ptr<User> sender_user) {
+            if (!sender_user) return;
 
-        auto room = co_await server_.GetRoom(room_id);
+            server_.GetRoom(room_id, [this, session, sender_user, target_username, message](std::shared_ptr<ChatRoom> room) {
+                WhisperResponse res{};
+                res.header.message_type = MessageType::WHISPER_RESPONSE;
+                res.header.packet_size = sizeof(WhisperResponse);
 
-        WhisperResponse res{};
-        res.header.message_type = MessageType::WHISPER_RESPONSE;
-        res.header.packet_size = sizeof(WhisperResponse);
+                if (!room)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                    return;
+                }
 
-        if (!room)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
-            session->SendMessage(&res, sizeof(WhisperResponse));
-            co_return;
-        }
+                if (sender_user->GetUsername() == target_username)
+                {
+                    res.success = false;
+                    std::strncpy(res.error_message, "CANNOT_WHISPER_SELF", sizeof(res.error_message) - 1);
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                    return;
+                }
 
-        if (sender_user->GetUsername() == target_username)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "CANNOT_WHISPER_SELF", sizeof(res.error_message) - 1);
-            session->SendMessage(&res, sizeof(WhisperResponse));
-            co_return;
-        }
+                user_manager_.GetUserByUsername(target_username, [session, sender_user, message, res](std::shared_ptr<User> target_user) mutable {
+                    if (!target_user)
+                    {
+                        res.success = false;
+                        std::strncpy(res.error_message, "USER_NOT_FOUND", sizeof(res.error_message) - 1);
+                    }
+                    else if (auto target_session = target_user->GetSession().lock())
+                    {
+                        WhisperNotification notif{};
+                        notif.header.packet_size = sizeof(WhisperNotification);
+                        notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
+                        std::strncpy(notif.sender_username, sender_user->GetUsername().c_str(), sizeof(notif.sender_username) - 1);
+                        std::strncpy(notif.message, message.c_str(), sizeof(notif.message) - 1);
 
-        auto target_user = co_await user_manager_.GetUserByUsername(target_username);
+                        target_session->SendMessage(&notif, sizeof(WhisperNotification));
+                        res.success = true;
+                    }
+                    else
+                    {
+                        res.success = false;
+                        std::strncpy(res.error_message, "TARGET_DISCONNECTED", sizeof(res.error_message) - 1);
+                    }
 
-        if (!target_user)
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "USER_NOT_FOUND", sizeof(res.error_message) - 1);
-        }
-        else if (auto target_session = target_user->GetSession().lock())
-        {
-            WhisperNotification notif{};
-            notif.header.packet_size = sizeof(WhisperNotification);
-            notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
-            std::strncpy(notif.sender_username, sender_user->GetUsername().c_str(), sizeof(notif.sender_username) - 1);
-            std::strncpy(notif.message, message.c_str(), sizeof(notif.message) - 1);
-
-            target_session->SendMessage(&notif, sizeof(WhisperNotification));
-            res.success = true;
-        }
-        else
-        {
-            res.success = false;
-            std::strncpy(res.error_message, "TARGET_DISCONNECTED", sizeof(res.error_message) - 1);
-        }
-
-        session->SendMessage(&res, sizeof(WhisperResponse));
+                    session->SendMessage(&res, sizeof(WhisperResponse));
+                });
+            });
+        });
     }
 
 private:
@@ -1249,7 +1263,7 @@ int main()
         auto server = std::make_shared<ChatServer>(io_context, 8080);
         server->CreateRoom(1, "Lobby", 100);
 
-        std::cout << "[Server] Running on port 8080 (Coroutine-based with Reconnection support)..." << std::endl;
+        std::cout << "[Server] Running on port 8080 (Optimized Strand & Coroutine Server)..." << std::endl;
 
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
