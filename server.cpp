@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <queue>
 #include <cstring>
 #include <thread>
@@ -229,7 +230,6 @@ public:
     void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
     const std::string& GetReconnectToken() const { return reconnect_token_; }
 
-    // 비동기 타이머I/O는 코루틴 활용
     template <typename OnExpiredCallback>
     void StartDisconnectTimer(OnExpiredCallback&& on_expired)
     {
@@ -315,7 +315,7 @@ private:
 };
 
 //=====================
-// 디스패처 인터페이스 (콜백 기반으로 변경)
+// 디스패처 인터페이스
 //=====================
 class IMessageHandler
 {
@@ -350,7 +350,7 @@ private:
 };
 
 //=====================
-// 유저 매니저 (내부 로직은 Strand 동기화 기반 일반 함수로 전환)
+// 유저 매니저
 //=====================
 class UserManager : public std::enable_shared_from_this<UserManager>
 {
@@ -398,7 +398,7 @@ public:
     }
 
     void TryReconnect(uint32_t user_id, const std::string& token, std::shared_ptr<ChatSession> new_session,
-                      std::function<void(bool, const std::string&)> callback)
+                     std::function<void(bool, const std::string&)> callback)
     {
         boost::asio::post(strand_, [this, self = shared_from_this(), user_id, token, new_session, callback]() {
             auto it = users_.find(user_id);
@@ -490,7 +490,7 @@ private:
 };
 
 //=====================
-// 세션 클래스 (네트워크 I/O 루프는 코루틴 유지)
+// 세션 클래스
 //=====================
 class ChatSession : public std::enable_shared_from_this<ChatSession>
 {
@@ -689,8 +689,26 @@ public:
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
     UserManager& GetUserManager() { return *user_manager_; }
 
+    void AddSession(std::shared_ptr<ChatSession> session)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), session]() {
+            sessions_.insert(session);
+            std::cout << "[Server] Client connected. Active FD/Sessions: " << sessions_.size() << std::endl;
+        });
+    }
+
+    void RemoveSession(std::shared_ptr<ChatSession> session)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), session]() {
+            sessions_.erase(session);
+            std::cout << "[Server] Client disconnected. Active FD/Sessions: " << sessions_.size() << std::endl;
+        });
+    }
+
     void OnSessionDisconnected(std::shared_ptr<ChatSession> session)
     {
+        RemoveSession(session);
+
         uint32_t user_id = session->GetUserId();
         if (user_id == 0) return;
 
@@ -765,7 +783,10 @@ public:
             while (true)
             {
                 tcp::socket socket = co_await acceptor_.async_accept(use_awaitable);
-                std::make_shared<ChatSession>(std::move(socket), *this)->Start();
+                auto session = std::make_shared<ChatSession>(std::move(socket), *this);
+                
+                AddSession(session);
+                session->Start();
             }
         }, detached);
     }
@@ -777,6 +798,7 @@ private:
     MessageDispatcher dispatcher_;
     std::shared_ptr<UserManager> user_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
+    std::unordered_set<std::shared_ptr<ChatSession>> sessions_;
     uint32_t next_room_id_ = 1;
 };
 
@@ -799,7 +821,7 @@ inline void ChatSession::ProcessPacket(const char* data, size_t size)
 }
 
 //=====================
-// 일반 핸들러 구현 (콜백 패턴 기반)
+// 핸들러 구현부
 //=====================
 class ReconnectHandler : public IMessageHandler
 {
@@ -1248,12 +1270,10 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::RECONNECT_REQUEST, std::make_unique<ReconnectHandler>(*user_manager_, *this));
-
-    StartAccept();
 }
 
 //=====================
-// 진입점
+// 메인 진입점
 //=====================
 int main()
 {
@@ -1261,6 +1281,7 @@ int main()
     {
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
+        server->StartAccept();
         server->CreateRoom(1, "Lobby", 100);
 
         std::cout << "[Server] Running on port 8080 (Optimized Strand & Coroutine Server)..." << std::endl;
