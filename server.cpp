@@ -4,6 +4,10 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/experimental/channel.hpp>
 
+// Boost.Redis 헤더
+#include <boost/redis/connection.hpp>
+#include <boost/redis/src.hpp>
+
 #include <memory>
 #include <iostream>
 #include <string>
@@ -208,6 +212,130 @@ class ChatServer;
 class ChatSession;
 
 //=====================
+// Redis 매니저 클래스
+//=====================
+class RedisManager : public std::enable_shared_from_this<RedisManager>
+{
+public:
+    explicit RedisManager(boost::asio::io_context& io_context)
+        : strand_(boost::asio::make_strand(io_context)),
+          conn_(std::make_shared<boost::redis::connection>(strand_)) {}
+
+    boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
+
+    awaitable<bool> ConnectAsync(const std::string& host, const std::string& port, const std::string& password = "")
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+
+        boost::redis::config cfg;
+        cfg.addr.host = host;
+        cfg.addr.port = port;
+        if (!password.empty())
+        {
+            cfg.password = password;
+        }
+
+        boost::system::error_code ec;
+        // async_run으로 redis 이벤트 생성
+        co_spawn(strand_, conn_->async_run(cfg, boost::redis::logger::e_quiet, boost::asio::detached), detached);
+        
+        is_connected_ = true;
+        std::cout << "[Redis] Connection initialized to " << host << ":" << port << std::endl;
+        co_return true;
+    }
+
+    awaitable<bool> SetAsync(const std::string& key, const std::string& value, int ttl_seconds = 0)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+        if (!is_connected_) co_return false;
+
+        boost::redis::request req;
+        if (ttl_seconds > 0)
+            req.push("SET", key, value, "EX", std::to_string(ttl_seconds));
+        else
+            req.push("SET", key, value);
+
+        boost::redis::response<std::string> resp;
+        boost::system::error_code ec;
+
+        co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
+        co_return !ec;
+    }
+
+    awaitable<std::string> GetAsync(const std::string& key)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+        if (!is_connected_) co_return "";
+
+        boost::redis::request req;
+        req.push("GET", key);
+
+        boost::redis::response<std::string> resp;
+        boost::system::error_code ec;
+
+        co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
+        if (ec) co_return "";
+
+        co_return std::get<0>(resp).value();
+    }
+
+    awaitable<bool> PublishAsync(const std::string& channel, const std::string& message)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+        if (!is_connected_) co_return false;
+
+        boost::redis::request req;
+        req.push("PUBLISH", channel, message);
+
+        boost::redis::response<int> resp;
+        boost::system::error_code ec;
+
+        co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
+        co_return !ec;
+    }
+
+    // Pub/Sub 상시 수신 루프 실행
+    template <typename MessageCallback>
+    void StartSubscribeLoop(const std::string& channel, MessageCallback&& on_message)
+    {
+        co_spawn(strand_, [this, self = shared_from_this(), channel, cb = std::forward<MessageCallback>(on_message)]() -> awaitable<void> {
+
+            boost::redis::request req;
+            req.push("SUBSCRIBE", channel);
+
+            boost::redis::response<boost::redis::ignore> resp;
+            boost::system::error_code ec;
+
+            co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
+            if (ec)
+            {
+                std::cerr << "[Redis] Subscribe failed on channel: " << channel << std::endl;
+                co_return;
+            }
+
+            // 상시 수신 루프
+            while (is_connected_)
+            {
+                boost::redis::response<std::string, std::string, std::string> sub_msg;
+                co_await conn_->async_receive(sub_msg, boost::asio::redirect_error(use_awaitable, ec));
+                if (ec) break;
+
+                // [0]: "message", [1]: channel name, [2]: payload
+                std::string rcv_channel = std::get<1>(sub_msg).value();
+                std::string payload = std::get<2>(sub_msg).value();
+
+                cb(rcv_channel, payload);
+            }
+        }, detached);
+    }
+
+private:
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    std::shared_ptr<boost::redis::connection> conn_;
+    bool is_connected_{false};
+};
+
+//=====================
 // 유저 클래스
 //=====================
 class User : public std::enable_shared_from_this<User>
@@ -277,11 +405,10 @@ public:
 
     bool WriteData(const char* data, size_t len)
     {
-        if (capacity_ - size_ < len) return false; // Overflow 방지
+        if (capacity_ - size_ < len) return false;
 
         size_t first_part = std::min(len, capacity_ - tail_);
         std::memcpy(&buffer_[tail_], data, first_part);
-        
         size_t second_part = len - first_part;
         if (second_part > 0)
         {
@@ -534,8 +661,6 @@ public:
     {
         co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
             StartIdleTimer();
-            
-            // 상시 대기 단일 WriteLoop 코루틴 가동
             co_spawn(strand_, WriteLoop(), detached);
 
             PacketHeader prompt_header{};
@@ -550,7 +675,6 @@ public:
         }, detached);
     }
 
-    // 채널에 던지기만 수행 (루프 껐다 켜기 X, Race Condition 완전 제거)
     void SendMessage(const void* data, size_t size)
     {
         if (is_disconnected_) return;
@@ -614,7 +738,6 @@ private:
             {
                 size_t length = co_await socket_.async_read_some(boost::asio::buffer(read_buffer_), use_awaitable);
                 ResetTimer();
-                
                 if (!packet_buffer_.WriteData(read_buffer_.data(), length))
                 {
                     std::cerr << "[Error] Ring Buffer Overflow! Closing Session." << std::endl;
@@ -635,14 +758,12 @@ private:
         }
     }
 
-    // 단 1개의 상시 대기 WriteLoop
     awaitable<void> WriteLoop()
     {
         try
         {
             while (!is_disconnected_)
             {
-                // 채널에서 데이터가 올 때까지 비동기 대기
                 auto [ec, msg] = co_await write_channel_.async_receive(use_awaitable);
                 if (ec || is_disconnected_) break;
 
@@ -663,15 +784,12 @@ private:
     uint32_t user_id_;
     bool is_authenticated_;
     bool is_disconnected_;
-    
     MessageChannel write_channel_;
     boost::asio::steady_timer idle_timer_;
-    
     std::vector<char> read_buffer_ = std::vector<char>(4096);
     RingPacketBuffer packet_buffer_;
 };
 
-// ChatRoom 내부 함수 정의
 inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
 {
     boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
@@ -715,6 +833,29 @@ public:
     boost::asio::io_context& GetIOContext() { return io_context_; }
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
     UserManager& GetUserManager() { return *user_manager_; }
+    std::shared_ptr<RedisManager> GetRedisManager() { return redis_manager_; }
+
+    awaitable<void> InitRedisAsync(const std::string& host, const std::string& port, const std::string& password = "")
+    {
+        co_await redis_manager_->ConnectAsync(host, port, password);
+
+        // Redis 멀티 서버 메시지 수신 채널 구독
+        redis_manager_->StartSubscribeLoop("chat_broadcast", [this](const std::string& channel, const std::string& payload) {
+            if (payload.size() < sizeof(ChatMessage)) return;
+
+            ChatMessage msg{};
+            std::memcpy(&msg, payload.data(), sizeof(ChatMessage));
+
+            co_spawn(strand_, [this, msg]() -> awaitable<void> {
+                auto room = co_await GetRoomAsync(msg.room_id);
+                if (room)
+                {
+                    // 서버 내에 존재하는 방일 경우 해당 방 접속자들에게 브로드캐스트
+                    room->BroadcastMessage(msg, msg.header.user_id);
+                }
+            }, detached);
+        });
+    }
 
     void AddSession(std::shared_ptr<ChatSession> session)
     {
@@ -813,6 +954,7 @@ private:
     tcp::acceptor acceptor_;
     MessageDispatcher dispatcher_;
     std::shared_ptr<UserManager> user_manager_;
+    std::shared_ptr<RedisManager> redis_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
     std::unordered_set<std::shared_ptr<ChatSession>> sessions_;
     uint32_t next_room_id_ = 1;
@@ -838,7 +980,7 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 핸들러 구현부 (co_await 리팩토링)
+// 핸들러 구현부
 //=====================
 class ReconnectHandler : public IMessageHandler
 {
@@ -1007,6 +1149,10 @@ public:
             session->SetUserId(existing_user->GetId());
             session->SetAuthenticated(true);
 
+            // Redis 세션 캐싱 적용 예시 (user:session:{user_id})
+            std::string redis_session_key = "user:session:" + std::to_string(existing_user->GetId());
+            co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
+
             response.success = true;
             response.assigned_user_id = existing_user->GetId();
 
@@ -1083,11 +1229,9 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        auto room = co_await server_.GetRoomAsync(message.room_id);
-        if (room)
-        {
-            room->BroadcastMessage(message, session->GetUserId());
-        }
+        // Redis Pub/Sub 채널로 전송하여 모든 서버 인스턴스로 브로드캐스트
+        std::string payload(reinterpret_cast<const char*>(&message), sizeof(ChatMessage));
+        co_await server_.GetRedisManager()->PublishAsync("chat_broadcast", payload);
     }
 
 private:
@@ -1244,7 +1388,8 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     : io_context_(io_context),
       strand_(boost::asio::make_strand(io_context)),
       acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
-      user_manager_(std::make_shared<UserManager>(io_context))
+      user_manager_(std::make_shared<UserManager>(io_context)),
+      redis_manager_(std::make_shared<RedisManager>(io_context))
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_));
@@ -1266,11 +1411,15 @@ int main()
     {
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
+
+        // Redis 연결 초기화 (IP / Port / Password 환경에 맞게 입력)
+        co_spawn(io_context, server->InitRedisAsync("127.0.0.1", "6379"), detached);
+
         server->StartAccept();
 
         co_spawn(io_context, server->CreateRoomAsync("Lobby", 100), detached);
 
-        std::cout << "[Server] Running on port 8080 (Fully Coroutine-Based Non-blocking Architecture)..." << std::endl;
+        std::cout << "[Server] Running on port 8080 with Redis Pub/Sub..." << std::endl;
 
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
