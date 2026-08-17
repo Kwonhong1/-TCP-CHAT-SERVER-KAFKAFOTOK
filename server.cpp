@@ -235,10 +235,11 @@ public:
             cfg.password = password;
         }
 
-        boost::system::error_code ec;
-        // async_run으로 redis 이벤트 생성
-        co_spawn(strand_, conn_->async_run(cfg, boost::redis::logger::e_quiet, boost::asio::detached), detached);
-        
+        co_spawn(strand_, [conn = conn_, cfg]() -> awaitable<void> {
+            co_await conn->async_run(cfg, boost::redis::logger{boost::redis::logger::level::disabled}, use_awaitable);
+            co_return; }, detached);
+
+
         is_connected_ = true;
         std::cout << "[Redis] Connection initialized to " << host << ":" << port << std::endl;
         co_return true;
@@ -294,16 +295,14 @@ public:
         co_return !ec;
     }
 
-    // Pub/Sub 상시 수신 루프 실행
     template <typename MessageCallback>
     void StartSubscribeLoop(const std::string& channel, MessageCallback&& on_message)
     {
-        co_spawn(strand_, [this, self = shared_from_this(), channel, cb = std::forward<MessageCallback>(on_message)]() -> awaitable<void> {
-
+        co_spawn(strand_, [this, self = shared_from_this(), channel, cb = std::forward<MessageCallback>(on_message)]() mutable -> awaitable<void> {
             boost::redis::request req;
             req.push("SUBSCRIBE", channel);
 
-            boost::redis::response<boost::redis::ignore> resp;
+            boost::redis::response<boost::redis::ignore_t> resp;
             boost::system::error_code ec;
 
             co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
@@ -313,18 +312,17 @@ public:
                 co_return;
             }
 
-            // 상시 수신 루프
             while (is_connected_)
             {
                 boost::redis::response<std::string, std::string, std::string> sub_msg;
-                co_await conn_->async_receive(sub_msg, boost::asio::redirect_error(use_awaitable, ec));
+                conn_->set_receive_response(sub_msg);
+                co_await conn_->async_receive(boost::asio::redirect_error(use_awaitable, ec));
                 if (ec) break;
 
-                // [0]: "message", [1]: channel name, [2]: payload
-                std::string rcv_channel = std::get<1>(sub_msg).value();
-                std::string payload = std::get<2>(sub_msg).value();
-
-                cb(rcv_channel, payload);
+                auto [cmd, ch, msg] = sub_msg;
+                if (ch.has_value() && msg.has_value()) {
+                    cb(ch.value(), msg.value());
+                }
             }
         }, detached);
     }
@@ -395,7 +393,7 @@ private:
 };
 
 //=====================
-// Ring Buffer (환형 버퍼) 패킷 버퍼
+// Ring Buffer 패킷 버퍼
 //=====================
 class RingPacketBuffer
 {
@@ -467,7 +465,7 @@ private:
 };
 
 //=====================
-// 코루틴 비동기 디스패처 인터페이스
+// 메시지 핸들러 인터페이스
 //=====================
 class IMessageHandler
 {
@@ -758,14 +756,15 @@ private:
         }
     }
 
+    // [수정] channel::async_receive 예외 및 구조분해 타입 에러 정돈
     awaitable<void> WriteLoop()
     {
         try
         {
             while (!is_disconnected_)
             {
-                auto [ec, msg] = co_await write_channel_.async_receive(use_awaitable);
-                if (ec || is_disconnected_) break;
+                std::vector<char> msg = co_await write_channel_.async_receive(use_awaitable);
+                if (is_disconnected_) break;
 
                 co_await boost::asio::async_write(socket_, boost::asio::buffer(msg.data(), msg.size()), use_awaitable);
             }
@@ -839,7 +838,6 @@ public:
     {
         co_await redis_manager_->ConnectAsync(host, port, password);
 
-        // Redis 멀티 서버 메시지 수신 채널 구독
         redis_manager_->StartSubscribeLoop("chat_broadcast", [this](const std::string& channel, const std::string& payload) {
             if (payload.size() < sizeof(ChatMessage)) return;
 
@@ -850,7 +848,6 @@ public:
                 auto room = co_await GetRoomAsync(msg.room_id);
                 if (room)
                 {
-                    // 서버 내에 존재하는 방일 경우 해당 방 접속자들에게 브로드캐스트
                     room->BroadcastMessage(msg, msg.header.user_id);
                 }
             }, detached);
@@ -1149,7 +1146,6 @@ public:
             session->SetUserId(existing_user->GetId());
             session->SetAuthenticated(true);
 
-            // Redis 세션 캐싱 적용 예시 (user:session:{user_id})
             std::string redis_session_key = "user:session:" + std::to_string(existing_user->GetId());
             co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
 
@@ -1229,7 +1225,6 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        // Redis Pub/Sub 채널로 전송하여 모든 서버 인스턴스로 브로드캐스트
         std::string payload(reinterpret_cast<const char*>(&message), sizeof(ChatMessage));
         co_await server_.GetRedisManager()->PublishAsync("chat_broadcast", payload);
     }
@@ -1412,7 +1407,6 @@ int main()
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
 
-        // Redis 연결 초기화 (IP / Port / Password 환경에 맞게 입력)
         co_spawn(io_context, server->InitRedisAsync("127.0.0.1", "6379"), detached);
 
         server->StartAccept();
