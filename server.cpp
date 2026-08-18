@@ -23,6 +23,10 @@
 #include <algorithm>
 #include <chrono>
 #include <optional>
+#include <queue>
+#include <mutex>
+#include <condition_variable>
+#include <functional>
 
 using boost::asio::ip::tcp;
 using boost::asio::awaitable;
@@ -211,7 +215,6 @@ struct ReconnectResponse
 };
 #pragma pack(pop)
 
-// DB 조회 결과를 전달할 구조체
 struct DBUserData
 {
     uint32_t id;
@@ -219,19 +222,24 @@ struct DBUserData
     std::string password_hash;
 };
 
-// 전방 선언
 class ChatServer;
 class ChatSession;
 
 //=====================
-// MySQL 데이터베이스 매니저
+// MySQL 데이터베이스 매니저 (Worker Thread 분리형)
 //=====================
 class DatabaseManager
 {
 public:
-    DatabaseManager() : conn_(nullptr) {}
+    DatabaseManager() : conn_(nullptr), stop_(false) {}
     ~DatabaseManager()
     {
+        {
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (db_thread_.joinable()) db_thread_.join();
         if (conn_) mysql_close(conn_);
     }
 
@@ -254,66 +262,49 @@ public:
             return false;
         }
 
-        std::cout << "[DB] Successfully connected to MySQL: " << dbname << std::endl;
+        std::cout << "[DB] Successfully connected to MySQL on Dedicated DB Thread." << std::endl;
+        db_thread_ = std::thread([this]() { WorkerLoop(); });
         return true;
     }
 
-    // 회원가입 (DB에 유저 저장)
-    std::pair<bool, uint32_t> RegisterUser(const std::string& username, const std::string& password)
+    void PostTask(std::function<void(MYSQL*)> task)
     {
-        std::string query = "INSERT INTO users (username, password_hash) VALUES ('"
-                            + username + "', '" + password + "');";
-
-        if (mysql_query(conn_, query.c_str()))
         {
-            std::cerr << "[DB Error] Register failed: " << mysql_error(conn_) << "\n";
-            return {false, 0};
+            std::lock_guard<std::mutex> lock(queue_mutex_);
+            tasks_.push(std::move(task));
         }
-
-        uint32_t assigned_id = static_cast<uint32_t>(mysql_insert_id(conn_));
-        return {true, assigned_id};
-    }
-
-    // 로그인 검증 및 유저 정보 조회
-    std::optional<DBUserData> AuthenticateUser(const std::string& username, const std::string& password)
-    {
-        std::string query = "SELECT id, username, password_hash FROM users WHERE username = '"
-                            + username + "' LIMIT 1;";
-
-        if (mysql_query(conn_, query.c_str()))
-        {
-            std::cerr << "[DB Error] Query failed: " << mysql_error(conn_) << "\n";
-            return std::nullopt;
-        }
-
-        MYSQL_RES* res = mysql_store_result(conn_);
-        if (!res) return std::nullopt;
-
-        MYSQL_ROW row = mysql_fetch_row(res);
-        if (!row)
-        {
-            mysql_free_result(res);
-            return std::nullopt; // 유저 없음
-        }
-
-        std::string db_pass = row[2];
-        if (db_pass != password)
-        {
-            mysql_free_result(res);
-            return std::nullopt; // 비밀번호 불일치
-        }
-
-        DBUserData user_data;
-        user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
-        user_data.username = row[1];
-        user_data.password_hash = row[2];
-
-        mysql_free_result(res);
-        return user_data;
+        cv_.notify_one();
     }
 
 private:
+    void WorkerLoop()
+    {
+        while (true)
+        {
+            std::function<void(MYSQL*)> task;
+            {
+                std::unique_lock<std::mutex> lock(queue_mutex_);
+                cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
+
+                if (stop_ && tasks_.empty()) break;
+
+                task = std::move(tasks_.front());
+                tasks_.pop();
+            }
+
+            if (task && conn_)
+            {
+                task(conn_);
+            }
+        }
+    }
+
     MYSQL* conn_;
+    std::thread db_thread_;
+    std::queue<std::function<void(MYSQL*)>> tasks_;
+    std::mutex queue_mutex_;
+    std::condition_variable cv_;
+    bool stop_;
 };
 
 //=====================
@@ -489,7 +480,6 @@ private:
     std::string username_;
     bool is_online_;
     std::weak_ptr<ChatSession> session_;
-
     std::string reconnect_token_;
     boost::asio::steady_timer disconnect_timer_;
 };
@@ -1082,10 +1072,10 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 핸들러 구현부 (MySQL DB 연동 적용)
+// 핸들러 구현부 (DB Task Queue 비동기 패턴 적용)
 //=====================
 
-// [1] 로그인 핸들러 (MySQL DB 검증 + Redis 세션 추가)
+// [1] 로그인 핸들러
 class LoginHandler : public IMessageHandler
 {
 public:
@@ -1100,16 +1090,53 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
+        auto executor = co_await boost::asio::this_coro::executor;
+
+        struct AuthResult {
+            bool success{false};
+            DBUserData user_data;
+        };
+
+        auto result_ptr = std::make_shared<AuthResult>();
+
+        // DB Worker Thread로 쿼리 실행 비동기 넘김
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                server_.GetDBManager()->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        MYSQL_RES* res = mysql_store_result(conn);
+                        if (res)
+                        {
+                            if (MYSQL_ROW row = mysql_fetch_row(res))
+                            {
+                                if (std::string(row[2]) == password)
+                                {
+                                    result_ptr->success = true;
+                                    result_ptr->user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
+                                    result_ptr->user_data.username = row[1];
+                                }
+                            }
+                            mysql_free_result(res);
+                        }
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        if (session->IsDisconnected()) co_return;
+
         LoginResponse response{};
         response.header.message_type = MessageType::LOGIN_RESPONSE;
         response.header.packet_size = sizeof(LoginResponse);
 
-        // 1. MySQL DB 검증
-        auto db_user = server_.GetDBManager()->AuthenticateUser(username, password);
-
-        if (session->IsDisconnected()) co_return;
-
-        if (!db_user.has_value())
+        if (!result_ptr->success)
         {
             response.success = false;
             std::strncpy(response.error_message, "INVALID_CREDENTIALS", sizeof(response.error_message) - 1);
@@ -1117,11 +1144,9 @@ public:
             co_return;
         }
 
-        // 2. 인증 성공 시 메모리 User 객체 가져오기 또는 생성
-        uint32_t user_id = db_user->id;
+        uint32_t user_id = result_ptr->user_data.id;
         auto user = co_await user_manager_.GetOrCreateMemoryUserAsync(user_id, username);
 
-        // 3. 중복 로그인 Kick 처리
         if (user->IsOnline())
         {
             if (auto old_session = user->GetSession().lock())
@@ -1139,7 +1164,6 @@ public:
         user->SetSession(session);
         user->SetOnline(true);
 
-        // 4. 재접속 토큰 세팅
         std::string token = "TOKEN_" + std::to_string(user_id) + "_SECRET";
         user->SetReconnectToken(token);
         std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
@@ -1147,14 +1171,12 @@ public:
         session->SetUserId(user_id);
         session->SetAuthenticated(true);
 
-        // 5. Redis에 세션 저장 (TTL: 3600초)
         std::string redis_session_key = "user:session:" + std::to_string(user_id);
         co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
 
         response.success = true;
         response.assigned_user_id = user_id;
 
-        // 6. 기본 로비 입장
         auto lobby = co_await server_.GetRoomAsync(1);
         if (lobby && !session->IsDisconnected())
         {
@@ -1172,7 +1194,7 @@ private:
     ChatServer& server_;
 };
 
-// [2] 회원가입 핸들러 (MySQL DB 저장)
+// [2] 회원가입 핸들러
 class RegisterHandler : public IMessageHandler
 {
 public:
@@ -1187,19 +1209,43 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
+        auto executor = co_await boost::asio::this_coro::executor;
+
+        struct RegisterResult {
+            bool success{false};
+            uint32_t assigned_id{0};
+        };
+
+        auto result_ptr = std::make_shared<RegisterResult>();
+
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                server_.GetDBManager()->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        result_ptr->success = true;
+                        result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        if (session->IsDisconnected()) co_return;
+
         RegisterResponse response{};
         response.header.message_type = MessageType::REGISTER_RESPONSE;
         response.header.packet_size = sizeof(RegisterResponse);
 
-        // DB에 유저 저장
-        auto [success, assigned_id] = server_.GetDBManager()->RegisterUser(username, password);
-
-        if (session->IsDisconnected()) co_return;
-
-        if (success)
+        if (result_ptr->success)
         {
             response.success = true;
-            response.assigned_user_id = assigned_id;
+            response.assigned_user_id = result_ptr->assigned_id;
         }
         else
         {
@@ -1518,7 +1564,7 @@ int main()
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
 
-        // 1. MySQL 접속 초기화 (DB 계정 설정 정보에 맞춰 수정)
+        // 1. MySQL 접속 초기화 (DB 전용 Worker Thread 생성됨)
         if (!server->InitDB("172.31.43.246", "game_user", "rnjsghd123@", "game_db"))
         {
             std::cerr << "[Server] Failed to initialize Database. Exiting..." << std::endl;
@@ -1532,12 +1578,17 @@ int main()
 
         co_spawn(io_context, server->CreateRoomAsync("Lobby", 100), detached);
 
-        std::cout << "[Server] Running on port 8080 with MySQL & Redis Pub/Sub..." << std::endl;
+        std::cout << "[Server] Running on port 8080 (3 Asio Threads + 1 DB Thread)..." << std::endl;
 
+        // 3. Asio IO 스레드 3개 생성 (총 4개 스레드)
         std::vector<std::thread> threads;
-        for (int i = 0; i < 4; ++i)
+        for (int i = 0; i < 3; ++i)
         {
-            threads.emplace_back([&io_context]() { io_context.run(); });
+            threads.emplace_back([&io_context, i]() {
+                std::cout << "[Asio Worker " << i + 1 << "] Started. Thread ID: " 
+                          << std::this_thread::get_id() << std::endl;
+                io_context.run();
+            });
         }
 
         for (auto& t : threads)
