@@ -4,9 +4,12 @@
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/experimental/channel.hpp>
 
-// Boost.Redis 헤더
+// Boost.Redis
 #include <boost/redis/connection.hpp>
 #include <boost/redis/src.hpp>
+
+// MySQL Native Driver
+#include <mysql/mysql.h>
 
 #include <memory>
 #include <iostream>
@@ -19,6 +22,7 @@
 #include <atomic>
 #include <algorithm>
 #include <chrono>
+#include <optional>
 
 using boost::asio::ip::tcp;
 using boost::asio::awaitable;
@@ -207,9 +211,110 @@ struct ReconnectResponse
 };
 #pragma pack(pop)
 
+// DB 조회 결과를 전달할 구조체
+struct DBUserData
+{
+    uint32_t id;
+    std::string username;
+    std::string password_hash;
+};
+
 // 전방 선언
 class ChatServer;
 class ChatSession;
+
+//=====================
+// MySQL 데이터베이스 매니저
+//=====================
+class DatabaseManager
+{
+public:
+    DatabaseManager() : conn_(nullptr) {}
+    ~DatabaseManager()
+    {
+        if (conn_) mysql_close(conn_);
+    }
+
+    bool Init(const std::string& host, const std::string& user,
+              const std::string& pass, const std::string& dbname, unsigned int port = 3306)
+    {
+        conn_ = mysql_init(nullptr);
+        if (!conn_)
+        {
+            std::cerr << "[DB Error] mysql_init failed\n";
+            return false;
+        }
+
+        if (!mysql_real_connect(conn_, host.c_str(), user.c_str(), pass.c_str(),
+                                dbname.c_str(), port, nullptr, 0))
+        {
+            std::cerr << "[DB Error] Connection failed: " << mysql_error(conn_) << "\n";
+            mysql_close(conn_);
+            conn_ = nullptr;
+            return false;
+        }
+
+        std::cout << "[DB] Successfully connected to MySQL: " << dbname << std::endl;
+        return true;
+    }
+
+    // 회원가입 (DB에 유저 저장)
+    std::pair<bool, uint32_t> RegisterUser(const std::string& username, const std::string& password)
+    {
+        std::string query = "INSERT INTO users (username, password_hash) VALUES ('"
+                            + username + "', '" + password + "');";
+
+        if (mysql_query(conn_, query.c_str()))
+        {
+            std::cerr << "[DB Error] Register failed: " << mysql_error(conn_) << "\n";
+            return {false, 0};
+        }
+
+        uint32_t assigned_id = static_cast<uint32_t>(mysql_insert_id(conn_));
+        return {true, assigned_id};
+    }
+
+    // 로그인 검증 및 유저 정보 조회
+    std::optional<DBUserData> AuthenticateUser(const std::string& username, const std::string& password)
+    {
+        std::string query = "SELECT id, username, password_hash FROM users WHERE username = '"
+                            + username + "' LIMIT 1;";
+
+        if (mysql_query(conn_, query.c_str()))
+        {
+            std::cerr << "[DB Error] Query failed: " << mysql_error(conn_) << "\n";
+            return std::nullopt;
+        }
+
+        MYSQL_RES* res = mysql_store_result(conn_);
+        if (!res) return std::nullopt;
+
+        MYSQL_ROW row = mysql_fetch_row(res);
+        if (!row)
+        {
+            mysql_free_result(res);
+            return std::nullopt; // 유저 없음
+        }
+
+        std::string db_pass = row[2];
+        if (db_pass != password)
+        {
+            mysql_free_result(res);
+            return std::nullopt; // 비밀번호 불일치
+        }
+
+        DBUserData user_data;
+        user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
+        user_data.username = row[1];
+        user_data.password_hash = row[2];
+
+        mysql_free_result(res);
+        return user_data;
+    }
+
+private:
+    MYSQL* conn_;
+};
 
 //=====================
 // Redis 매니저 클래스
@@ -230,15 +335,12 @@ public:
         boost::redis::config cfg;
         cfg.addr.host = host;
         cfg.addr.port = port;
-        if (!password.empty())
-        {
-            cfg.password = password;
-        }
+        if (!password.empty()) cfg.password = password;
 
         co_spawn(strand_, [conn = conn_, cfg]() -> awaitable<void> {
             co_await conn->async_run(cfg, boost::redis::logger{boost::redis::logger::level::disabled}, use_awaitable);
-            co_return; }, detached);
-
+            co_return;
+        }, detached);
 
         is_connected_ = true;
         std::cout << "[Redis] Connection initialized to " << host << ":" << port << std::endl;
@@ -506,24 +608,22 @@ class UserManager : public std::enable_shared_from_this<UserManager>
 {
 public:
     explicit UserManager(boost::asio::io_context& io_context)
-        : io_context_(io_context), strand_(boost::asio::make_strand(io_context)), next_user_id_(1) {}
+        : io_context_(io_context), strand_(boost::asio::make_strand(io_context)) {}
 
     boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
 
-    awaitable<std::shared_ptr<User>> CreateUserAsync(std::string username, uint64_t password)
+    awaitable<std::shared_ptr<User>> GetOrCreateMemoryUserAsync(uint32_t user_id, const std::string& username)
     {
         co_await boost::asio::post(strand_, use_awaitable);
 
-        for (const auto& [id, user] : users_) {
-            if (user->GetUsername() == username) {
-                co_return nullptr;
-            }
+        auto it = users_.find(user_id);
+        if (it != users_.end())
+        {
+            co_return it->second;
         }
-        uint32_t user_id = next_user_id_++;
+
         auto user = std::make_shared<User>(io_context_, user_id, username);
-        user->SetPassword(password);
         users_[user_id] = user;
-        std::cout << "[UserManager] New user created: " << username << " (ID: " << user_id << ")" << std::endl;
         co_return user;
     }
 
@@ -570,7 +670,6 @@ private:
     boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
-    uint32_t next_user_id_;
 };
 
 //=====================
@@ -756,7 +855,6 @@ private:
         }
     }
 
-    // [수정] channel::async_receive 예외 및 구조분해 타입 에러 정돈
     awaitable<void> WriteLoop()
     {
         try
@@ -833,6 +931,12 @@ public:
     MessageDispatcher& GetDispatcher() { return dispatcher_; }
     UserManager& GetUserManager() { return *user_manager_; }
     std::shared_ptr<RedisManager> GetRedisManager() { return redis_manager_; }
+    std::shared_ptr<DatabaseManager> GetDBManager() { return db_manager_; }
+
+    bool InitDB(const std::string& host, const std::string& user, const std::string& pass, const std::string& dbname)
+    {
+        return db_manager_->Init(host, user, pass, dbname);
+    }
 
     awaitable<void> InitRedisAsync(const std::string& host, const std::string& port, const std::string& password = "")
     {
@@ -952,6 +1056,7 @@ private:
     MessageDispatcher dispatcher_;
     std::shared_ptr<UserManager> user_manager_;
     std::shared_ptr<RedisManager> redis_manager_;
+    std::shared_ptr<DatabaseManager> db_manager_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
     std::unordered_set<std::shared_ptr<ChatSession>> sessions_;
     uint32_t next_room_id_ = 1;
@@ -977,8 +1082,139 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 핸들러 구현부
+// 핸들러 구현부 (MySQL DB 연동 적용)
 //=====================
+
+// [1] 로그인 핸들러 (MySQL DB 검증 + Redis 세션 추가)
+class LoginHandler : public IMessageHandler
+{
+public:
+    LoginHandler(UserManager& user_manager, ChatServer& server)
+        : user_manager_(user_manager), server_(server) {}
+
+    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (size < sizeof(LoginRequest)) co_return;
+        const auto& request = *reinterpret_cast<const LoginRequest*>(data);
+
+        std::string username = request.username;
+        std::string password = request.password;
+
+        LoginResponse response{};
+        response.header.message_type = MessageType::LOGIN_RESPONSE;
+        response.header.packet_size = sizeof(LoginResponse);
+
+        // 1. MySQL DB 검증
+        auto db_user = server_.GetDBManager()->AuthenticateUser(username, password);
+
+        if (session->IsDisconnected()) co_return;
+
+        if (!db_user.has_value())
+        {
+            response.success = false;
+            std::strncpy(response.error_message, "INVALID_CREDENTIALS", sizeof(response.error_message) - 1);
+            session->SendMessage(&response, sizeof(LoginResponse));
+            co_return;
+        }
+
+        // 2. 인증 성공 시 메모리 User 객체 가져오기 또는 생성
+        uint32_t user_id = db_user->id;
+        auto user = co_await user_manager_.GetOrCreateMemoryUserAsync(user_id, username);
+
+        // 3. 중복 로그인 Kick 처리
+        if (user->IsOnline())
+        {
+            if (auto old_session = user->GetSession().lock())
+            {
+                ServerNotification kick_notif{};
+                kick_notif.header.packet_size = sizeof(ServerNotification);
+                kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+                std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
+                old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
+                old_session->Kick();
+            }
+            user->CancelDisconnectTimer();
+        }
+
+        user->SetSession(session);
+        user->SetOnline(true);
+
+        // 4. 재접속 토큰 세팅
+        std::string token = "TOKEN_" + std::to_string(user_id) + "_SECRET";
+        user->SetReconnectToken(token);
+        std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
+
+        session->SetUserId(user_id);
+        session->SetAuthenticated(true);
+
+        // 5. Redis에 세션 저장 (TTL: 3600초)
+        std::string redis_session_key = "user:session:" + std::to_string(user_id);
+        co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
+
+        response.success = true;
+        response.assigned_user_id = user_id;
+
+        // 6. 기본 로비 입장
+        auto lobby = co_await server_.GetRoomAsync(1);
+        if (lobby && !session->IsDisconnected())
+        {
+            co_await lobby->AddUserAsync(user);
+        }
+
+        if (!session->IsDisconnected())
+        {
+            session->SendMessage(&response, sizeof(LoginResponse));
+        }
+    }
+
+private:
+    UserManager& user_manager_;
+    ChatServer& server_;
+};
+
+// [2] 회원가입 핸들러 (MySQL DB 저장)
+class RegisterHandler : public IMessageHandler
+{
+public:
+    RegisterHandler(UserManager& user_manager, ChatServer& server)
+        : user_manager_(user_manager), server_(server) {}
+
+    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (size < sizeof(RegisterRequest)) co_return;
+        const auto& request = *reinterpret_cast<const RegisterRequest*>(data);
+
+        std::string username = request.username;
+        std::string password = request.password;
+
+        RegisterResponse response{};
+        response.header.message_type = MessageType::REGISTER_RESPONSE;
+        response.header.packet_size = sizeof(RegisterResponse);
+
+        // DB에 유저 저장
+        auto [success, assigned_id] = server_.GetDBManager()->RegisterUser(username, password);
+
+        if (session->IsDisconnected()) co_return;
+
+        if (success)
+        {
+            response.success = true;
+            response.assigned_user_id = assigned_id;
+        }
+        else
+        {
+            response.success = false;
+            std::strncpy(response.error_message, "REGISTER_FAILED_OR_DUPLICATE", sizeof(response.error_message) - 1);
+        }
+
+        session->SendMessage(&response, sizeof(RegisterResponse));
+    }
+
+private:
+    UserManager& user_manager_;
+    ChatServer& server_;
+};
+
 class ReconnectHandler : public IMessageHandler
 {
 public:
@@ -1087,132 +1323,6 @@ public:
 
 private:
     ChatServer& server_;
-};
-
-class LoginHandler : public IMessageHandler
-{
-public:
-    LoginHandler(UserManager& user_manager, ChatServer& server)
-        : user_manager_(user_manager), server_(server) {}
-
-    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
-    {
-        if (size < sizeof(LoginRequest)) co_return;
-        const auto& request = *reinterpret_cast<const LoginRequest*>(data);
-
-        std::string username = request.username;
-        uint64_t pass = 0;
-        try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
-
-        auto existing_user = co_await user_manager_.GetUserByUsernameAsync(username);
-
-        if (session->IsDisconnected()) co_return;
-
-        LoginResponse response{};
-        response.header.message_type = MessageType::LOGIN_RESPONSE;
-        response.header.packet_size = sizeof(LoginResponse);
-
-        if (!existing_user)
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "USER_NOT_FOUND", sizeof(response.error_message) - 1);
-            session->SendMessage(&response, sizeof(LoginResponse));
-            co_return;
-        }
-
-        if (existing_user->GetPassword() == pass)
-        {
-            if (existing_user->IsOnline())
-            {
-                if (auto old_session = existing_user->GetSession().lock())
-                {
-                    ServerNotification kick_notif{};
-                    kick_notif.header.packet_size = sizeof(ServerNotification);
-                    kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
-                    std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
-                    old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
-                    old_session->Kick();
-                }
-                existing_user->CancelDisconnectTimer();
-            }
-
-            existing_user->SetSession(session);
-            existing_user->SetOnline(true);
-
-            std::string token = "TOKEN_" + std::to_string(existing_user->GetId()) + "_SECRET";
-            existing_user->SetReconnectToken(token);
-            std::strncpy(response.reconnect_token, token.c_str(), sizeof(response.reconnect_token) - 1);
-
-            session->SetUserId(existing_user->GetId());
-            session->SetAuthenticated(true);
-
-            std::string redis_session_key = "user:session:" + std::to_string(existing_user->GetId());
-            co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
-
-            response.success = true;
-            response.assigned_user_id = existing_user->GetId();
-
-            auto lobby = co_await server_.GetRoomAsync(1);
-            if (lobby && !session->IsDisconnected())
-            {
-                co_await lobby->AddUserAsync(existing_user);
-            }
-
-            if (!session->IsDisconnected())
-            {
-                session->SendMessage(&response, sizeof(LoginResponse));
-            }
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "WRONG_PASSWORD", sizeof(response.error_message) - 1);
-            session->SendMessage(&response, sizeof(LoginResponse));
-        }
-    }
-
-private:
-    UserManager& user_manager_;
-    ChatServer& server_;
-};
-
-class RegisterHandler : public IMessageHandler
-{
-public:
-    explicit RegisterHandler(UserManager& user_manager) : user_manager_(user_manager) {}
-
-    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
-    {
-        if (size < sizeof(RegisterRequest)) co_return;
-        const auto& request = *reinterpret_cast<const RegisterRequest*>(data);
-
-        uint64_t pass = 0;
-        try { pass = std::stoull(request.password); } catch (...) { pass = 0; }
-
-        auto new_user = co_await user_manager_.CreateUserAsync(request.username, pass);
-
-        if (session->IsDisconnected()) co_return;
-
-        RegisterResponse response{};
-        response.header.message_type = MessageType::REGISTER_RESPONSE;
-        response.header.packet_size = sizeof(RegisterResponse);
-
-        if (new_user)
-        {
-            response.success = true;
-            response.assigned_user_id = new_user->GetId();
-        }
-        else
-        {
-            response.success = false;
-            std::strncpy(response.error_message, "Username already exists.", sizeof(response.error_message) - 1);
-        }
-
-        session->SendMessage(&response, sizeof(RegisterResponse));
-    }
-
-private:
-    UserManager& user_manager_;
 };
 
 class ChatMessageHandler : public IMessageHandler
@@ -1384,10 +1494,11 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
       strand_(boost::asio::make_strand(io_context)),
       acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
       user_manager_(std::make_shared<UserManager>(io_context)),
-      redis_manager_(std::make_shared<RedisManager>(io_context))
+      redis_manager_(std::make_shared<RedisManager>(io_context)),
+      db_manager_(std::make_shared<DatabaseManager>())
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
-    dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_));
+    dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::CHAT_MESSAGE, std::make_unique<ChatMessageHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::CREATE_ROOM_REQUEST, std::make_unique<CreateRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::ROOM_LIST_REQUEST, std::make_unique<RoomListHandler>(*this));
@@ -1407,13 +1518,21 @@ int main()
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
 
-        co_spawn(io_context, server->InitRedisAsync("127.0.0.1", "6379"), detached);
+        // 1. MySQL 접속 초기화 (DB 계정 설정 정보에 맞춰 수정)
+        if (!server->InitDB("172.31.43.246", "game_user", "rnjsghd123@", "game_db"))
+        {
+            std::cerr << "[Server] Failed to initialize Database. Exiting..." << std::endl;
+            return 1;
+        }
+
+        // 2. Redis 접속 비동기 실행
+        co_spawn(io_context, server->InitRedisAsync("172.31.43.246", "6379"), detached);
 
         server->StartAccept();
 
         co_spawn(io_context, server->CreateRoomAsync("Lobby", 100), detached);
 
-        std::cout << "[Server] Running on port 8080 with Redis Pub/Sub..." << std::endl;
+        std::cout << "[Server] Running on port 8080 with MySQL & Redis Pub/Sub..." << std::endl;
 
         std::vector<std::thread> threads;
         for (int i = 0; i < 4; ++i)
