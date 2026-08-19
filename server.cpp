@@ -308,93 +308,6 @@ private:
 };
 
 //=====================
-// DB 전담 핸들러
-//=====================
-class DBHandler
-{
-public:
-    explicit DBHandler(std::shared_ptr<DatabaseManager> db_mgr)
-        : db_mgr_(db_mgr) {}
-
-    struct AuthResult {
-        bool success{false};
-        DBUserData user_data;
-    };
-
-    awaitable<AuthResult> AuthenticateUserAsync(std::string username, std::string password)
-    {
-        auto executor = co_await boost::asio::this_coro::executor;
-        auto result_ptr = std::make_shared<AuthResult>();
-
-        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
-            [this, username, password, result_ptr, executor](auto handler) {
-                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
-                    std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
-                    if (mysql_query(conn, query.c_str()) == 0)
-                    {
-                        MYSQL_RES* res = mysql_store_result(conn);
-                        if (res)
-                        {
-                            if (MYSQL_ROW row = mysql_fetch_row(res))
-                            {
-                                if (std::string(row[2]) == password)
-                                {
-                                    result_ptr->success = true;
-                                    result_ptr->user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
-                                    result_ptr->user_data.username = row[1];
-                                }
-                            }
-                            mysql_free_result(res);
-                        }
-                    }
-
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
-                    });
-                });
-            },
-            use_awaitable
-        );
-
-        co_return *result_ptr;
-    }
-
-    struct RegisterResult {
-        bool success{false};
-        uint32_t assigned_id{0};
-    };
-
-    awaitable<RegisterResult> RegisterUserAsync(std::string username, std::string password)
-    {
-        auto executor = co_await boost::asio::this_coro::executor;
-        auto result_ptr = std::make_shared<RegisterResult>();
-
-        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
-            [this, username, password, result_ptr, executor](auto handler) {
-                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
-                    std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
-                    if (mysql_query(conn, query.c_str()) == 0)
-                    {
-                        result_ptr->success = true;
-                        result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
-                    }
-
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
-                    });
-                });
-            },
-            use_awaitable
-        );
-
-        co_return *result_ptr;
-    }
-
-private:
-    std::shared_ptr<DatabaseManager> db_mgr_;
-};
-
-//=====================
 // Redis 매니저 클래스
 //=====================
 class RedisManager : public std::enable_shared_from_this<RedisManager>
@@ -514,21 +427,126 @@ private:
 };
 
 //=====================
-// Redis 전담 핸들러
+// Repository 레이어 (DB / Redis 추상화 및 구현)
 //=====================
-class RedisHandler
+
+// 1. User DB 접근용 Repository 인터페이스 및 구현
+class IUserRepository
 {
 public:
-    explicit RedisHandler(std::shared_ptr<RedisManager> redis_mgr)
+    virtual ~IUserRepository() = default;
+
+    struct AuthResult {
+        bool success{false};
+        DBUserData user_data;
+    };
+
+    struct RegisterResult {
+        bool success{false};
+        uint32_t assigned_id{0};
+    };
+
+    virtual awaitable<AuthResult> AuthenticateUserAsync(std::string username, std::string password) = 0;
+    virtual awaitable<RegisterResult> RegisterUserAsync(std::string username, std::string password) = 0;
+};
+
+class MySqlUserRepository : public IUserRepository
+{
+public:
+    explicit MySqlUserRepository(std::shared_ptr<DatabaseManager> db_mgr)
+        : db_mgr_(db_mgr) {}
+
+    awaitable<AuthResult> AuthenticateUserAsync(std::string username, std::string password) override
+    {
+        auto executor = co_await boost::asio::this_coro::executor;
+        auto result_ptr = std::make_shared<AuthResult>();
+
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        MYSQL_RES* res = mysql_store_result(conn);
+                        if (res)
+                        {
+                            if (MYSQL_ROW row = mysql_fetch_row(res))
+                            {
+                                if (std::string(row[2]) == password)
+                                {
+                                    result_ptr->success = true;
+                                    result_ptr->user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
+                                    result_ptr->user_data.username = row[1];
+                                }
+                            }
+                            mysql_free_result(res);
+                        }
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        co_return *result_ptr;
+    }
+
+    awaitable<RegisterResult> RegisterUserAsync(std::string username, std::string password) override
+    {
+        auto executor = co_await boost::asio::this_coro::executor;
+        auto result_ptr = std::make_shared<RegisterResult>();
+
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        result_ptr->success = true;
+                        result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        co_return *result_ptr;
+    }
+
+private:
+    std::shared_ptr<DatabaseManager> db_mgr_;
+};
+
+// 2. Redis 캐시/세션 접근용 Repository 인터페이스 및 구현
+class ISessionRepository
+{
+public:
+    virtual ~ISessionRepository() = default;
+
+    virtual awaitable<bool> SetUserSessionStateAsync(uint32_t user_id, const std::string& state, int ttl_seconds = 3600) = 0;
+    virtual awaitable<bool> PublishChatMessageAsync(const ChatMessage& msg) = 0;
+};
+
+class RedisSessionRepository : public ISessionRepository
+{
+public:
+    explicit RedisSessionRepository(std::shared_ptr<RedisManager> redis_mgr)
         : redis_mgr_(redis_mgr) {}
 
-    awaitable<bool> SetUserSessionStateAsync(uint32_t user_id, const std::string& state, int ttl_seconds = 3600)
+    awaitable<bool> SetUserSessionStateAsync(uint32_t user_id, const std::string& state, int ttl_seconds = 3600) override
     {
         std::string key = "user:session:" + std::to_string(user_id);
         co_return co_await redis_mgr_->SetAsync(key, state, ttl_seconds);
     }
 
-    awaitable<bool> PublishChatMessageAsync(const ChatMessage& msg)
+    awaitable<bool> PublishChatMessageAsync(const ChatMessage& msg) override
     {
         std::string payload(reinterpret_cast<const char*>(&msg), sizeof(ChatMessage));
         co_return co_await redis_mgr_->PublishAsync("chat_broadcast", payload);
@@ -1040,8 +1058,10 @@ public:
     UserManager& GetUserManager() { return *user_manager_; }
     std::shared_ptr<RedisManager> GetRedisManager() { return redis_manager_; }
     std::shared_ptr<DatabaseManager> GetDBManager() { return db_manager_; }
-    std::shared_ptr<DBHandler> GetDBHandler() { return db_handler_; }
-    std::shared_ptr<RedisHandler> GetRedisHandler() { return redis_handler_; }
+    
+    // Repository 매핑 반환
+    std::shared_ptr<IUserRepository> GetUserRepository() { return user_repository_; }
+    std::shared_ptr<ISessionRepository> GetSessionRepository() { return session_repository_; }
 
     bool InitDB(const std::string& host, const std::string& user, const std::string& pass, const std::string& dbname)
     {
@@ -1052,7 +1072,7 @@ public:
     {
         co_await redis_manager_->ConnectAsync(host, port, password);
 
-        redis_handler_->SubscribeChatBroadcast([this](const std::string& channel, const std::string& payload) {
+        session_repository_->SubscribeChatBroadcast([this](const std::string& channel, const std::string& payload) {
             if (payload.size() < sizeof(ChatMessage)) return;
 
             ChatMessage msg{};
@@ -1167,8 +1187,11 @@ private:
     std::shared_ptr<UserManager> user_manager_;
     std::shared_ptr<RedisManager> redis_manager_;
     std::shared_ptr<DatabaseManager> db_manager_;
-    std::shared_ptr<DBHandler> db_handler_;
-    std::shared_ptr<RedisHandler> redis_handler_;
+    
+    // Repository 객체들
+    std::shared_ptr<IUserRepository> user_repository_;
+    std::shared_ptr<RedisSessionRepository> session_repository_;
+
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
     std::unordered_set<std::shared_ptr<ChatSession>> sessions_;
     uint32_t next_room_id_ = 1;
@@ -1194,7 +1217,7 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 핸들러 구현부 (DBHandler & RedisHandler 활용)
+// 패킷 핸들러 구현부 (Repository 활용)
 //=====================
 
 // [1] 로그인 핸들러
@@ -1212,7 +1235,8 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        auto auth_result = co_await server_.GetDBHandler()->AuthenticateUserAsync(username, password);
+        // IUserRepository를 통한 인증 요청
+        auto auth_result = co_await server_.GetUserRepository()->AuthenticateUserAsync(username, password);
 
         if (session->IsDisconnected()) co_return;
 
@@ -1255,7 +1279,8 @@ public:
         session->SetUserId(user_id);
         session->SetAuthenticated(true);
 
-        co_await server_.GetRedisHandler()->SetUserSessionStateAsync(user_id, "ONLINE", 3600);
+        // ISessionRepository를 통한 세션 상태 업데이트
+        co_await server_.GetSessionRepository()->SetUserSessionStateAsync(user_id, "ONLINE", 3600);
 
         response.success = true;
         response.assigned_user_id = user_id;
@@ -1292,7 +1317,8 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        auto reg_result = co_await server_.GetDBHandler()->RegisterUserAsync(username, password);
+        // IUserRepository를 통한 회원가입 처리
+        auto reg_result = co_await server_.GetUserRepository()->RegisterUserAsync(username, password);
 
         if (session->IsDisconnected()) co_return;
 
@@ -1439,7 +1465,8 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        co_await server_.GetRedisHandler()->PublishChatMessageAsync(message);
+        // ISessionRepository를 통한 메시지 발행
+        co_await server_.GetSessionRepository()->PublishChatMessageAsync(message);
     }
 
 private:
@@ -1599,8 +1626,8 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
       user_manager_(std::make_shared<UserManager>(io_context)),
       redis_manager_(std::make_shared<RedisManager>(io_context)),
       db_manager_(std::make_shared<DatabaseManager>()),
-      db_handler_(std::make_shared<DBHandler>(db_manager_)),
-      redis_handler_(std::make_shared<RedisHandler>(redis_manager_))
+      user_repository_(std::make_shared<MySqlUserRepository>(db_manager_)),
+      session_repository_(std::make_shared<RedisSessionRepository>(redis_manager_))
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_, *this));
@@ -1623,7 +1650,7 @@ int main()
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
 
-        // 1. MySQL 접속 초기화 (DB 전용 Worker Thread 생성됨)
+        // 1. MySQL 접속 초기화
         if (!server->InitDB("172.31.43.246", "game_user", "rnjsghd123@", "game_db"))
         {
             std::cerr << "[Server] Failed to initialize Database. Exiting..." << std::endl;
@@ -1639,7 +1666,7 @@ int main()
 
         std::cout << "[Server] Running on port 8080 (3 Asio Threads + 1 DB Thread)..." << std::endl;
 
-        // 3. Asio IO 스레드 3개 생성 (총 4개 스레드)
+        // 3. Asio IO 스레드 3개 생성
         std::vector<std::thread> threads;
         for (int i = 0; i < 3; ++i)
         {
