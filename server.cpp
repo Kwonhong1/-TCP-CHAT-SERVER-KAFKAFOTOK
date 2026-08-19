@@ -281,7 +281,7 @@ private:
     {
         while (true)
         {
-            std::function<void(MYSQL*)> task;
+            std::function<void(MYSQL*)> task; //!1 원래 우리 fuction이 아니라 썼지 않아?
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
@@ -349,7 +349,7 @@ public:
         else
             req.push("SET", key, value);
 
-        boost::redis::response<std::string> resp;
+        boost::redis::response<std::string> resp; //!2 response가 버퍼 역할을 하는 건가?
         boost::system::error_code ec;
 
         co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
@@ -373,7 +373,7 @@ public:
         co_return std::get<0>(resp).value();
     }
 
-    awaitable<bool> PublishAsync(const std::string& channel, const std::string& message)
+    awaitable<bool> PublishAsync(const std::string& channel, const std::string& message) //!3 채널이랑 퍼블리쉬, 섭스크라이브 설명 다시 해줘
     {
         co_await boost::asio::post(strand_, use_awaitable);
         if (!is_connected_) co_return false;
@@ -388,7 +388,7 @@ public:
         co_return !ec;
     }
 
-    template <typename MessageCallback>
+    template <typename MessageCallback>//!4여기도 갑자기 콜백이 있어 우리 콜백 안 쓰기로 한 거 아녔어? 그리고 채널이 이미 하는 건 뭐야 여기서
     void StartSubscribeLoop(const std::string& channel, MessageCallback&& on_message)
     {
         co_spawn(strand_, [this, self = shared_from_this(), channel, cb = std::forward<MessageCallback>(on_message)]() mutable -> awaitable<void> {
@@ -451,7 +451,7 @@ public:
     void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
     const std::string& GetReconnectToken() const { return reconnect_token_; }
 
-    template <typename OnExpiredCallback>
+    template <typename OnExpiredCallback> //!5여기도 콜백이 남아 잇어
     void StartDisconnectTimer(OnExpiredCallback&& on_expired)
     {
         co_spawn(strand_, [this, self = shared_from_this(), cb = std::forward<OnExpiredCallback>(on_expired)]() mutable -> awaitable<void> {
@@ -711,7 +711,7 @@ public:
     }
 
     void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id);
-    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);
+    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);//!6 얘네만 왜 바로 적용하고, 핸들러에 따로 있는지
 
 private:
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
@@ -747,7 +747,7 @@ public:
     void Start()
     {
         co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
-            StartIdleTimer();
+            StartIdleTimer();//! co_spanw이 중첩으로 사용됐는데 괜찮나?
             co_spawn(strand_, WriteLoop(), detached);
 
             PacketHeader prompt_header{};
@@ -792,7 +792,7 @@ public:
 private:
     void StartIdleTimer()
     {
-        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
+        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {//!7 co_spawn하고 그 내부에 while도 괜찮아?
             while (!is_disconnected_)
             {
                 boost::system::error_code ec;
@@ -948,7 +948,7 @@ public:
         });
     }
 
-    void AddSession(std::shared_ptr<ChatSession> session)
+    void AddSession(std::shared_ptr<ChatSession> session)//!8얘넨 코루틴 안 한 이유는?
     {
         boost::asio::post(strand_, [this, self = shared_from_this(), session]() {
             sessions_.insert(session);
@@ -1063,7 +1063,7 @@ inline void ChatSession::Disconnect()
     socket_.close(ec);
     server_.OnSessionDisconnected(shared_from_this());
 }
-
+//!9 inline은 따지고 보면 coroutine이랑 비슷하네?
 inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) co_return;
@@ -1129,7 +1129,7 @@ public:
             },
             use_awaitable
         );
-
+//!10 db 핸들러를 따로 둘까?
         if (session->IsDisconnected()) co_return;
 
         LoginResponse response{};
@@ -1258,7 +1258,7 @@ public:
 
 private:
     UserManager& user_manager_;
-    ChatServer& server_;
+    ChatServer& server_; //!11 여기서 스마트 포인터를 쓰지 않는 이유는 결국 서버가 터지면 여기도 소유권을 잃어야 하기 때문인가?
 };
 
 class ReconnectHandler : public IMessageHandler
