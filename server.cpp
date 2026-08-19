@@ -281,7 +281,7 @@ private:
     {
         while (true)
         {
-            std::function<void(MYSQL*)> task; //!1 원래 우리 fuction이 아니라 썼지 않아?
+            std::function<void(MYSQL*)> task;
             {
                 std::unique_lock<std::mutex> lock(queue_mutex_);
                 cv_.wait(lock, [this]() { return stop_ || !tasks_.empty(); });
@@ -305,6 +305,93 @@ private:
     std::mutex queue_mutex_;
     std::condition_variable cv_;
     bool stop_;
+};
+
+//=====================
+// DB 전담 핸들러
+//=====================
+class DBHandler
+{
+public:
+    explicit DBHandler(std::shared_ptr<DatabaseManager> db_mgr)
+        : db_mgr_(db_mgr) {}
+
+    struct AuthResult {
+        bool success{false};
+        DBUserData user_data;
+    };
+
+    awaitable<AuthResult> AuthenticateUserAsync(std::string username, std::string password)
+    {
+        auto executor = co_await boost::asio::this_coro::executor;
+        auto result_ptr = std::make_shared<AuthResult>();
+
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        MYSQL_RES* res = mysql_store_result(conn);
+                        if (res)
+                        {
+                            if (MYSQL_ROW row = mysql_fetch_row(res))
+                            {
+                                if (std::string(row[2]) == password)
+                                {
+                                    result_ptr->success = true;
+                                    result_ptr->user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
+                                    result_ptr->user_data.username = row[1];
+                                }
+                            }
+                            mysql_free_result(res);
+                        }
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        co_return *result_ptr;
+    }
+
+    struct RegisterResult {
+        bool success{false};
+        uint32_t assigned_id{0};
+    };
+
+    awaitable<RegisterResult> RegisterUserAsync(std::string username, std::string password)
+    {
+        auto executor = co_await boost::asio::this_coro::executor;
+        auto result_ptr = std::make_shared<RegisterResult>();
+
+        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
+            [this, username, password, result_ptr, executor](auto handler) {
+                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                    std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
+                    if (mysql_query(conn, query.c_str()) == 0)
+                    {
+                        result_ptr->success = true;
+                        result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
+                    }
+
+                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
+                        handler(boost::system::error_code{});
+                    });
+                });
+            },
+            use_awaitable
+        );
+
+        co_return *result_ptr;
+    }
+
+private:
+    std::shared_ptr<DatabaseManager> db_mgr_;
 };
 
 //=====================
@@ -349,7 +436,7 @@ public:
         else
             req.push("SET", key, value);
 
-        boost::redis::response<std::string> resp; //!2 response가 버퍼 역할을 하는 건가?
+        boost::redis::response<std::string> resp;
         boost::system::error_code ec;
 
         co_await conn_->async_exec(req, resp, boost::asio::redirect_error(use_awaitable, ec));
@@ -373,7 +460,7 @@ public:
         co_return std::get<0>(resp).value();
     }
 
-    awaitable<bool> PublishAsync(const std::string& channel, const std::string& message) //!3 채널이랑 퍼블리쉬, 섭스크라이브 설명 다시 해줘
+    awaitable<bool> PublishAsync(const std::string& channel, const std::string& message)
     {
         co_await boost::asio::post(strand_, use_awaitable);
         if (!is_connected_) co_return false;
@@ -388,7 +475,7 @@ public:
         co_return !ec;
     }
 
-    template <typename MessageCallback>//!4여기도 갑자기 콜백이 있어 우리 콜백 안 쓰기로 한 거 아녔어? 그리고 채널이 이미 하는 건 뭐야 여기서
+    template <typename MessageCallback>
     void StartSubscribeLoop(const std::string& channel, MessageCallback&& on_message)
     {
         co_spawn(strand_, [this, self = shared_from_this(), channel, cb = std::forward<MessageCallback>(on_message)]() mutable -> awaitable<void> {
@@ -427,6 +514,37 @@ private:
 };
 
 //=====================
+// Redis 전담 핸들러
+//=====================
+class RedisHandler
+{
+public:
+    explicit RedisHandler(std::shared_ptr<RedisManager> redis_mgr)
+        : redis_mgr_(redis_mgr) {}
+
+    awaitable<bool> SetUserSessionStateAsync(uint32_t user_id, const std::string& state, int ttl_seconds = 3600)
+    {
+        std::string key = "user:session:" + std::to_string(user_id);
+        co_return co_await redis_mgr_->SetAsync(key, state, ttl_seconds);
+    }
+
+    awaitable<bool> PublishChatMessageAsync(const ChatMessage& msg)
+    {
+        std::string payload(reinterpret_cast<const char*>(&msg), sizeof(ChatMessage));
+        co_return co_await redis_mgr_->PublishAsync("chat_broadcast", payload);
+    }
+
+    template <typename MessageCallback>
+    void SubscribeChatBroadcast(MessageCallback&& on_message)
+    {
+        redis_mgr_->StartSubscribeLoop("chat_broadcast", std::forward<MessageCallback>(on_message));
+    }
+
+private:
+    std::shared_ptr<RedisManager> redis_mgr_;
+};
+
+//=====================
 // 유저 클래스
 //=====================
 class User : public std::enable_shared_from_this<User>
@@ -451,7 +569,7 @@ public:
     void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
     const std::string& GetReconnectToken() const { return reconnect_token_; }
 
-    template <typename OnExpiredCallback> //!5여기도 콜백이 남아 잇어
+    template <typename OnExpiredCallback>
     void StartDisconnectTimer(OnExpiredCallback&& on_expired)
     {
         co_spawn(strand_, [this, self = shared_from_this(), cb = std::forward<OnExpiredCallback>(on_expired)]() mutable -> awaitable<void> {
@@ -711,7 +829,7 @@ public:
     }
 
     void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id);
-    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);//!6 얘네만 왜 바로 적용하고, 핸들러에 따로 있는지
+    void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);
 
 private:
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
@@ -747,7 +865,7 @@ public:
     void Start()
     {
         co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
-            StartIdleTimer();//! co_spanw이 중첩으로 사용됐는데 괜찮나?
+            StartIdleTimer();
             co_spawn(strand_, WriteLoop(), detached);
 
             PacketHeader prompt_header{};
@@ -792,7 +910,7 @@ public:
 private:
     void StartIdleTimer()
     {
-        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {//!7 co_spawn하고 그 내부에 while도 괜찮아?
+        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
             while (!is_disconnected_)
             {
                 boost::system::error_code ec;
@@ -922,6 +1040,8 @@ public:
     UserManager& GetUserManager() { return *user_manager_; }
     std::shared_ptr<RedisManager> GetRedisManager() { return redis_manager_; }
     std::shared_ptr<DatabaseManager> GetDBManager() { return db_manager_; }
+    std::shared_ptr<DBHandler> GetDBHandler() { return db_handler_; }
+    std::shared_ptr<RedisHandler> GetRedisHandler() { return redis_handler_; }
 
     bool InitDB(const std::string& host, const std::string& user, const std::string& pass, const std::string& dbname)
     {
@@ -932,7 +1052,7 @@ public:
     {
         co_await redis_manager_->ConnectAsync(host, port, password);
 
-        redis_manager_->StartSubscribeLoop("chat_broadcast", [this](const std::string& channel, const std::string& payload) {
+        redis_handler_->SubscribeChatBroadcast([this](const std::string& channel, const std::string& payload) {
             if (payload.size() < sizeof(ChatMessage)) return;
 
             ChatMessage msg{};
@@ -948,7 +1068,7 @@ public:
         });
     }
 
-    void AddSession(std::shared_ptr<ChatSession> session)//!8얘넨 코루틴 안 한 이유는?
+    void AddSession(std::shared_ptr<ChatSession> session)
     {
         boost::asio::post(strand_, [this, self = shared_from_this(), session]() {
             sessions_.insert(session);
@@ -1047,6 +1167,8 @@ private:
     std::shared_ptr<UserManager> user_manager_;
     std::shared_ptr<RedisManager> redis_manager_;
     std::shared_ptr<DatabaseManager> db_manager_;
+    std::shared_ptr<DBHandler> db_handler_;
+    std::shared_ptr<RedisHandler> redis_handler_;
     std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>> rooms_;
     std::unordered_set<std::shared_ptr<ChatSession>> sessions_;
     uint32_t next_room_id_ = 1;
@@ -1063,7 +1185,7 @@ inline void ChatSession::Disconnect()
     socket_.close(ec);
     server_.OnSessionDisconnected(shared_from_this());
 }
-//!9 inline은 따지고 보면 coroutine이랑 비슷하네?
+
 inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) co_return;
@@ -1072,7 +1194,7 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 핸들러 구현부 (DB Task Queue 비동기 패턴 적용)
+// 핸들러 구현부 (DBHandler & RedisHandler 활용)
 //=====================
 
 // [1] 로그인 핸들러
@@ -1090,53 +1212,15 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        auto executor = co_await boost::asio::this_coro::executor;
+        auto auth_result = co_await server_.GetDBHandler()->AuthenticateUserAsync(username, password);
 
-        struct AuthResult {
-            bool success{false};
-            DBUserData user_data;
-        };
-
-        auto result_ptr = std::make_shared<AuthResult>();
-
-        // DB Worker Thread로 쿼리 실행 비동기 넘김
-        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
-            [this, username, password, result_ptr, executor](auto handler) {
-                server_.GetDBManager()->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
-                    std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
-                    if (mysql_query(conn, query.c_str()) == 0)
-                    {
-                        MYSQL_RES* res = mysql_store_result(conn);
-                        if (res)
-                        {
-                            if (MYSQL_ROW row = mysql_fetch_row(res))
-                            {
-                                if (std::string(row[2]) == password)
-                                {
-                                    result_ptr->success = true;
-                                    result_ptr->user_data.id = static_cast<uint32_t>(std::stoul(row[0]));
-                                    result_ptr->user_data.username = row[1];
-                                }
-                            }
-                            mysql_free_result(res);
-                        }
-                    }
-
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
-                    });
-                });
-            },
-            use_awaitable
-        );
-//!10 db 핸들러를 따로 둘까?
         if (session->IsDisconnected()) co_return;
 
         LoginResponse response{};
         response.header.message_type = MessageType::LOGIN_RESPONSE;
         response.header.packet_size = sizeof(LoginResponse);
 
-        if (!result_ptr->success)
+        if (!auth_result.success)
         {
             response.success = false;
             std::strncpy(response.error_message, "INVALID_CREDENTIALS", sizeof(response.error_message) - 1);
@@ -1144,7 +1228,7 @@ public:
             co_return;
         }
 
-        uint32_t user_id = result_ptr->user_data.id;
+        uint32_t user_id = auth_result.user_data.id;
         auto user = co_await user_manager_.GetOrCreateMemoryUserAsync(user_id, username);
 
         if (user->IsOnline())
@@ -1171,8 +1255,7 @@ public:
         session->SetUserId(user_id);
         session->SetAuthenticated(true);
 
-        std::string redis_session_key = "user:session:" + std::to_string(user_id);
-        co_await server_.GetRedisManager()->SetAsync(redis_session_key, "ONLINE", 3600);
+        co_await server_.GetRedisHandler()->SetUserSessionStateAsync(user_id, "ONLINE", 3600);
 
         response.success = true;
         response.assigned_user_id = user_id;
@@ -1209,32 +1292,7 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        auto executor = co_await boost::asio::this_coro::executor;
-
-        struct RegisterResult {
-            bool success{false};
-            uint32_t assigned_id{0};
-        };
-
-        auto result_ptr = std::make_shared<RegisterResult>();
-
-        co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
-            [this, username, password, result_ptr, executor](auto handler) {
-                server_.GetDBManager()->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
-                    std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
-                    if (mysql_query(conn, query.c_str()) == 0)
-                    {
-                        result_ptr->success = true;
-                        result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
-                    }
-
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
-                    });
-                });
-            },
-            use_awaitable
-        );
+        auto reg_result = co_await server_.GetDBHandler()->RegisterUserAsync(username, password);
 
         if (session->IsDisconnected()) co_return;
 
@@ -1242,10 +1300,10 @@ public:
         response.header.message_type = MessageType::REGISTER_RESPONSE;
         response.header.packet_size = sizeof(RegisterResponse);
 
-        if (result_ptr->success)
+        if (reg_result.success)
         {
             response.success = true;
-            response.assigned_user_id = result_ptr->assigned_id;
+            response.assigned_user_id = reg_result.assigned_id;
         }
         else
         {
@@ -1258,7 +1316,7 @@ public:
 
 private:
     UserManager& user_manager_;
-    ChatServer& server_; //!11 여기서 스마트 포인터를 쓰지 않는 이유는 결국 서버가 터지면 여기도 소유권을 잃어야 하기 때문인가?
+    ChatServer& server_;
 };
 
 class ReconnectHandler : public IMessageHandler
@@ -1381,8 +1439,7 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        std::string payload(reinterpret_cast<const char*>(&message), sizeof(ChatMessage));
-        co_await server_.GetRedisManager()->PublishAsync("chat_broadcast", payload);
+        co_await server_.GetRedisHandler()->PublishChatMessageAsync(message);
     }
 
 private:
@@ -1541,7 +1598,9 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
       acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
       user_manager_(std::make_shared<UserManager>(io_context)),
       redis_manager_(std::make_shared<RedisManager>(io_context)),
-      db_manager_(std::make_shared<DatabaseManager>())
+      db_manager_(std::make_shared<DatabaseManager>()),
+      db_handler_(std::make_shared<DBHandler>(db_manager_)),
+      redis_handler_(std::make_shared<RedisHandler>(redis_manager_))
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_, *this));
