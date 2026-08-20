@@ -276,7 +276,7 @@ class ChatServer;
 class ChatSession;
 
 //=====================
-// MySQL 데이터베이스 매니저 (Worker Thread 분리형)
+// MySQL 데이터베이스 매니저 (Worker Thread 전용)
 //=====================
 class DatabaseManager
 {
@@ -358,7 +358,7 @@ private:
 };
 
 //=====================
-// Redis 매니저 클래스
+// Redis 매니저 클래스 (Lock-Free Strand 사용)
 //=====================
 class RedisManager : public std::enable_shared_from_this<RedisManager>
 {
@@ -775,7 +775,7 @@ private:
 };
 
 //=====================
-// 유저 매니저
+// 유저 매니저 (Lock-Free Strand 기반)
 //=====================
 class UserManager : public std::enable_shared_from_this<UserManager>
 {
@@ -846,7 +846,7 @@ private:
 };
 
 //=====================
-// 채팅방
+// 채팅방 (Lock-Free Strand 기반)
 //=====================
 class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
@@ -956,7 +956,7 @@ private:
 };
 
 //=====================
-// 세션 클래스
+// 세션 클래스 (Lock-Free Strand 기반)
 //=====================
 using MessageChannel = boost::asio::experimental::channel<void(boost::system::error_code, std::vector<char>)>;
 
@@ -998,9 +998,10 @@ public:
 
     void SendMessage(const void* data, size_t size)
     {
-        if (is_disconnected_) return;
-        std::vector<char> message(static_cast<const char*>(data), static_cast<const char*>(data) + size);
-        write_channel_.try_send(boost::system::error_code{}, std::move(message));
+        boost::asio::post(strand_, [this, self = shared_from_this(), msg_data = std::vector<char>(static_cast<const char*>(data), static_cast<const char*>(data) + size)]() mutable {
+            if (is_disconnected_) return;
+            write_channel_.try_send(boost::system::error_code{}, std::move(msg_data));
+        });
     }
 
     void SetUserId(uint32_t id) { user_id_ = id; }
@@ -1111,6 +1112,9 @@ private:
     RingPacketBuffer packet_buffer_;
 };
 
+//=====================
+// ChatRoom 브로드캐스트 구현 (Lock-Free Strand로 세션 포스트)
+//=====================
 inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
 {
     boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
@@ -1118,6 +1122,7 @@ inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_i
         {
             if (auto session = user->GetSession().lock())
             {
+                // 세션 스레드로 비동기 post (Lock 없이 완전히 안전함)
                 session->SendMessage(&msg, sizeof(ChatMessage));
             }
         }
@@ -1126,21 +1131,23 @@ inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_i
 
 inline void ChatRoom::BroadcastNotification(const std::string& notification_text, uint32_t except_user_id)
 {
-    ServerNotification notif{};
-    notif.header.packet_size = sizeof(ServerNotification);
-    notif.header.message_type = MessageType::SERVER_NOTIFICATION;
-    notif.header.user_id = 0;
-    notif.header.sequence_number = 0;
-    std::strncpy(notif.message, notification_text.c_str(), sizeof(notif.message) - 1);
+    boost::asio::post(strand_, [this, self = shared_from_this(), notification_text, except_user_id]() {
+        ServerNotification notif{};
+        notif.header.packet_size = sizeof(ServerNotification);
+        notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+        notif.header.user_id = 0;
+        notif.header.sequence_number = 0;
+        std::strncpy(notif.message, notification_text.c_str(), sizeof(notif.message) - 1);
 
-    for (auto& [id, user] : users_)
-    {
-        if (id == except_user_id) continue;
-        if (auto session = user->GetSession().lock())
+        for (auto& [id, user] : users_)
         {
-            session->SendMessage(&notif, sizeof(ServerNotification));
+            if (id == except_user_id) continue;
+            if (auto session = user->GetSession().lock())
+            {
+                session->SendMessage(&notif, sizeof(ServerNotification));
+            }
         }
-    }
+    });
 }
 
 //=====================
