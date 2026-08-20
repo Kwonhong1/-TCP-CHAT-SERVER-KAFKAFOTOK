@@ -34,31 +34,59 @@ using boost::asio::use_awaitable;
 using boost::asio::co_spawn;
 using boost::asio::detached;
 
+//=====================
+// 방 권한 비트마스크
+//=====================
+enum class RoomPermission : uint32_t
+{
+    NONE          = 0,
+    CHAT          = 1 << 0, // 0x01: 일반 채팅
+    KICK_USER     = 1 << 1, // 0x02: 유저 강퇴
+    BAN_USER      = 1 << 2, // 0x04: 영구 차단
+    CHANGE_CONFIG = 1 << 3, // 0x08: 방 설정 변경
+    DELEGATE_HOST = 1 << 4, // 0x10: 방장 위임
+
+    // 역할별 프리셋
+    MEMBER        = CHAT,
+    HOST          = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
+};
+
+inline RoomPermission operator|(RoomPermission a, RoomPermission b) {
+    return static_cast<RoomPermission>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+inline bool HasPermission(RoomPermission user_perm, RoomPermission required_perm) {
+    return (static_cast<uint32_t>(user_perm) & static_cast<uint32_t>(required_perm)) == static_cast<uint32_t>(required_perm);
+}
+
 // 메시지 타입 정의
 enum class MessageType : uint16_t
 {
-    LOGIN_PROMPT = 1000,
-    LOGIN_REQUEST = 1001,
-    LOGIN_RESPONSE = 1002,
-    LOGOUT_REQUEST = 1003,
-    LOGOUT_RESPONSE = 1004,
-    CHAT_MESSAGE = 1005,
-    JOIN_ROOM = 1006,
-    LEAVE_ROOM = 1007,
-    CREATE_ROOM_REQUEST = 1008,
+    LOGIN_PROMPT        = 1000,
+    LOGIN_REQUEST       = 1001,
+    LOGIN_RESPONSE      = 1002,
+    LOGOUT_REQUEST      = 1003,
+    LOGOUT_RESPONSE     = 1004,
+    CHAT_MESSAGE        = 1005,
+    JOIN_ROOM           = 1006,
+    LEAVE_ROOM          = 1007,
+    CREATE_ROOM_REQUEST  = 1008,
     CREATE_ROOM_RESPONSE = 1009,
-    ROOM_LIST_REQUEST = 1010,
-    ROOM_LIST_RESPONSE = 1011,
+    ROOM_LIST_REQUEST   = 1010,
+    ROOM_LIST_RESPONSE  = 1011,
     SERVER_NOTIFICATION = 1013,
-    REGISTER_REQUEST = 1014,
-    REGISTER_RESPONSE = 1015,
-    JOIN_ROOM_RESPONSE = 1016,
+    REGISTER_REQUEST    = 1014,
+    REGISTER_RESPONSE   = 1015,
+    JOIN_ROOM_RESPONSE  = 1016,
     LEAVE_ROOM_RESPONSE = 1017,
-    WHISPER_REQUEST = 1018,
-    WHISPER_RESPONSE = 1019,
-    WHISPER_NOTIFICATION = 1020,
-    RECONNECT_REQUEST = 1021,
-    RECONNECT_RESPONSE = 1022
+    WHISPER_REQUEST     = 1018,
+    WHISPER_RESPONSE    = 1019,
+    WHISPER_NOTIFICATION= 1020,
+    RECONNECT_REQUEST   = 1021,
+    RECONNECT_RESPONSE  = 1022,
+    KICK_USER_REQUEST   = 1023,
+    KICK_USER_RESPONSE  = 1024,
+    KICKED_NOTIFICATION = 1025
 };
 
 #pragma pack(push, 1)
@@ -212,6 +240,28 @@ struct ReconnectResponse
     bool success;
     uint32_t restored_room_id;
     char error_message[128];
+};
+
+struct KickUserRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t target_user_id;
+};
+
+struct KickUserResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t target_user_id;
+    char error_message[128];
+};
+
+struct KickedNotification
+{
+    PacketHeader header;
+    uint32_t room_id;
+    char reason[128];
 };
 #pragma pack(pop)
 
@@ -427,10 +477,8 @@ private:
 };
 
 //=====================
-// Repository 레이어 (DB / Redis 추상화 및 구현)
+// Repository 레이어
 //=====================
-
-// 1. User DB 접근용 Repository 인터페이스 및 구현
 class IUserRepository
 {
 public:
@@ -524,7 +572,6 @@ private:
     std::shared_ptr<DatabaseManager> db_mgr_;
 };
 
-// 2. Redis 캐시/세션 접근용 Repository 인터페이스 및 구현
 class ISessionRepository
 {
 public:
@@ -814,7 +861,7 @@ public:
     uint32_t GetMaxUsers() const { return max_users_; }
     uint32_t GetCurrentUsers() const { return static_cast<uint32_t>(users_.size()); }
 
-    awaitable<std::pair<bool, std::string>> AddUserAsync(std::shared_ptr<User> user)
+    awaitable<std::pair<bool, std::string>> AddUserAsync(std::shared_ptr<User> user, RoomPermission perm = RoomPermission::MEMBER)
     {
         co_await boost::asio::post(strand_, use_awaitable);
 
@@ -828,6 +875,8 @@ public:
         }
 
         users_[user->GetId()] = user;
+        user_permissions_[user->GetId()] = perm;
+
         BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
         co_return std::make_pair(true, "");
     }
@@ -842,7 +891,55 @@ public:
         }
         std::string username = it->second->GetUsername();
         users_.erase(it);
+        user_permissions_.erase(user_id);
+
         BroadcastNotification(username + " left the room.", user_id);
+        co_return std::make_pair(true, "");
+    }
+
+    awaitable<bool> CheckPermissionAsync(uint32_t user_id, RoomPermission required_perm)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+        auto it = user_permissions_.find(user_id);
+        if (it == user_permissions_.end()) co_return false;
+
+        co_return HasPermission(it->second, required_perm);
+    }
+
+    awaitable<std::pair<bool, std::string>> KickUserAsync(uint32_t operator_id, uint32_t target_id)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+
+        auto perm_it = user_permissions_.find(operator_id);
+        if (perm_it == user_permissions_.end() || !HasPermission(perm_it->second, RoomPermission::KICK_USER)) {
+            co_return std::make_pair(false, "PERMISSION_DENIED");
+        }
+
+        auto user_it = users_.find(target_id);
+        if (user_it == users_.end()) {
+            co_return std::make_pair(false, "TARGET_NOT_IN_ROOM");
+        }
+
+        if (operator_id == target_id) {
+            co_return std::make_pair(false, "CANNOT_KICK_SELF");
+        }
+
+        auto target_user = user_it->second;
+
+        if (auto session = target_user->GetSession().lock())
+        {
+            KickedNotification notif{};
+            notif.header.packet_size = sizeof(KickedNotification);
+            notif.header.message_type = MessageType::KICKED_NOTIFICATION;
+            notif.room_id = room_id_;
+            std::strncpy(notif.reason, "Kicked by room host.", sizeof(notif.reason) - 1);
+            session->SendMessage(&notif, sizeof(KickedNotification));
+        }
+
+        users_.erase(user_it);
+        user_permissions_.erase(target_id);
+
+        BroadcastNotification(target_user->GetUsername() + " has been kicked.", 0);
         co_return std::make_pair(true, "");
     }
 
@@ -855,6 +952,7 @@ private:
     std::string name_;
     uint32_t max_users_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
+    std::unordered_map<uint32_t, RoomPermission> user_permissions_;
 };
 
 //=====================
@@ -1058,8 +1156,6 @@ public:
     UserManager& GetUserManager() { return *user_manager_; }
     std::shared_ptr<RedisManager> GetRedisManager() { return redis_manager_; }
     std::shared_ptr<DatabaseManager> GetDBManager() { return db_manager_; }
-    
-    // Repository 매핑 반환
     std::shared_ptr<IUserRepository> GetUserRepository() { return user_repository_; }
     std::shared_ptr<ISessionRepository> GetSessionRepository() { return session_repository_; }
 
@@ -1187,8 +1283,6 @@ private:
     std::shared_ptr<UserManager> user_manager_;
     std::shared_ptr<RedisManager> redis_manager_;
     std::shared_ptr<DatabaseManager> db_manager_;
-    
-    // Repository 객체들
     std::shared_ptr<IUserRepository> user_repository_;
     std::shared_ptr<RedisSessionRepository> session_repository_;
 
@@ -1217,10 +1311,9 @@ inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t 
 }
 
 //=====================
-// 패킷 핸들러 구현부 (Repository 활용)
+// 패킷 핸들러 구현부
 //=====================
 
-// [1] 로그인 핸들러
 class LoginHandler : public IMessageHandler
 {
 public:
@@ -1235,7 +1328,6 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        // IUserRepository를 통한 인증 요청
         auto auth_result = co_await server_.GetUserRepository()->AuthenticateUserAsync(username, password);
 
         if (session->IsDisconnected()) co_return;
@@ -1279,7 +1371,6 @@ public:
         session->SetUserId(user_id);
         session->SetAuthenticated(true);
 
-        // ISessionRepository를 통한 세션 상태 업데이트
         co_await server_.GetSessionRepository()->SetUserSessionStateAsync(user_id, "ONLINE", 3600);
 
         response.success = true;
@@ -1288,7 +1379,7 @@ public:
         auto lobby = co_await server_.GetRoomAsync(1);
         if (lobby && !session->IsDisconnected())
         {
-            co_await lobby->AddUserAsync(user);
+            co_await lobby->AddUserAsync(user, RoomPermission::MEMBER);
         }
 
         if (!session->IsDisconnected())
@@ -1302,7 +1393,6 @@ private:
     ChatServer& server_;
 };
 
-// [2] 회원가입 핸들러
 class RegisterHandler : public IMessageHandler
 {
 public:
@@ -1317,7 +1407,6 @@ public:
         std::string username = request.username;
         std::string password = request.password;
 
-        // IUserRepository를 통한 회원가입 처리
         auto reg_result = co_await server_.GetUserRepository()->RegisterUserAsync(username, password);
 
         if (session->IsDisconnected()) co_return;
@@ -1380,7 +1469,7 @@ public:
         auto room = co_await server_.GetRoomAsync(req.last_room_id);
         if (room && !session->IsDisconnected())
         {
-            auto [joined, join_err] = co_await room->AddUserAsync(user);
+            auto [joined, join_err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
             res.success = true;
             res.restored_room_id = joined ? req.last_room_id : 0;
         }
@@ -1409,16 +1498,68 @@ public:
         const auto& req = *reinterpret_cast<const CreateRoomRequest*>(data);
 
         uint32_t created_room_id = co_await server_.CreateRoomAsync(req.room_name, req.max_users);
+        auto room = co_await server_.GetRoomAsync(created_room_id);
+        auto user = co_await server_.GetUserManager().GetUserAsync(session->GetUserId());
 
         if (session->IsDisconnected()) co_return;
 
         CreateRoomResponse res{};
         res.header.message_type = MessageType::CREATE_ROOM_RESPONSE;
         res.header.packet_size = sizeof(CreateRoomResponse);
-        res.success = true;
-        res.created_room_id = created_room_id;
+
+        if (room && user)
+        {
+            co_await room->AddUserAsync(user, RoomPermission::HOST);
+            res.success = true;
+            res.created_room_id = created_room_id;
+        }
+        else
+        {
+            res.success = false;
+            std::strncpy(res.error_message, "ROOM_CREATION_FAILED", sizeof(res.error_message) - 1);
+        }
 
         session->SendMessage(&res, sizeof(CreateRoomResponse));
+    }
+
+private:
+    ChatServer& server_;
+};
+
+class KickUserHandler : public IMessageHandler
+{
+public:
+    explicit KickUserHandler(ChatServer& server) : server_(server) {}
+
+    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(KickUserRequest)) co_return;
+        const auto& req = *reinterpret_cast<const KickUserRequest*>(data);
+
+        auto room = co_await server_.GetRoomAsync(req.room_id);
+
+        KickUserResponse res{};
+        res.header.message_type = MessageType::KICK_USER_RESPONSE;
+        res.header.packet_size = sizeof(KickUserResponse);
+        res.target_user_id = req.target_user_id;
+
+        if (!room)
+        {
+            res.success = false;
+            std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+            session->SendMessage(&res, sizeof(KickUserResponse));
+            co_return;
+        }
+
+        auto [success, err] = co_await room->KickUserAsync(session->GetUserId(), req.target_user_id);
+        res.success = success;
+        if (!success) {
+            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+        }
+
+        if (!session->IsDisconnected()) {
+            session->SendMessage(&res, sizeof(KickUserResponse));
+        }
     }
 
 private:
@@ -1465,7 +1606,6 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(ChatMessage)) co_return;
         const auto& message = *reinterpret_cast<const ChatMessage*>(data);
 
-        // ISessionRepository를 통한 메시지 발행
         co_await server_.GetSessionRepository()->PublishChatMessageAsync(message);
     }
 
@@ -1502,7 +1642,7 @@ public:
             co_return;
         }
 
-        auto [success, err] = co_await room->AddUserAsync(user);
+        auto [success, err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
         res.success = success;
         if (!success) std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
 
@@ -1638,6 +1778,7 @@ inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::LEAVE_ROOM, std::make_unique<LeaveRoomHandler>(*this));
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::RECONNECT_REQUEST, std::make_unique<ReconnectHandler>(*user_manager_, *this));
+    dispatcher_.RegisterHandler(MessageType::KICK_USER_REQUEST, std::make_unique<KickUserHandler>(*this));
 }
 
 //=====================
@@ -1650,14 +1791,12 @@ int main()
         boost::asio::io_context io_context;
         auto server = std::make_shared<ChatServer>(io_context, 8080);
 
-        // 1. MySQL 접속 초기화
         if (!server->InitDB("172.31.43.246", "game_user", "rnjsghd123@", "game_db"))
         {
             std::cerr << "[Server] Failed to initialize Database. Exiting..." << std::endl;
             return 1;
         }
 
-        // 2. Redis 접속 비동기 실행
         co_spawn(io_context, server->InitRedisAsync("172.31.43.246", "6379"), detached);
 
         server->StartAccept();
@@ -1666,7 +1805,6 @@ int main()
 
         std::cout << "[Server] Running on port 8080 (3 Asio Threads + 1 DB Thread)..." << std::endl;
 
-        // 3. Asio IO 스레드 3개 생성
         std::vector<std::thread> threads;
         for (int i = 0; i < 3; ++i)
         {
