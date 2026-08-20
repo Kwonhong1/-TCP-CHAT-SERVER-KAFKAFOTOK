@@ -39,53 +39,53 @@ using boost::asio::detached;
 //=====================
 enum class RoomPermission : uint32_t
 {
-    NONE          = 0,
-    CHAT          = 1 << 0, // 0x01: 일반 채팅
-    KICK_USER     = 1 << 1, // 0x02: 유저 강퇴
-    BAN_USER      = 1 << 2, // 0x04: 영구 차단
+    NONE = 0,
+    CHAT = 1 << 0,          // 0x01: 일반 채팅
+    KICK_USER = 1 << 1,     // 0x02: 유저 강퇴
+    BAN_USER = 1 << 2,      // 0x04: 영구 차단
     CHANGE_CONFIG = 1 << 3, // 0x08: 방 설정 변경
     DELEGATE_HOST = 1 << 4, // 0x10: 방장 위임
 
     // 역할별 프리셋
-    MEMBER        = CHAT,
-    HOST          = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
+    MEMBER = CHAT,
+    HOST = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
 };
 
-inline RoomPermission operator|(RoomPermission a, RoomPermission b) {
+RoomPermission operator|(RoomPermission a, RoomPermission b) {
     return static_cast<RoomPermission>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-inline bool HasPermission(RoomPermission user_perm, RoomPermission required_perm) {
+bool HasPermission(RoomPermission user_perm, RoomPermission required_perm) {
     return (static_cast<uint32_t>(user_perm) & static_cast<uint32_t>(required_perm)) == static_cast<uint32_t>(required_perm);
 }
 
 // 메시지 타입 정의
 enum class MessageType : uint16_t
 {
-    LOGIN_PROMPT        = 1000,
-    LOGIN_REQUEST       = 1001,
-    LOGIN_RESPONSE      = 1002,
-    LOGOUT_REQUEST      = 1003,
-    LOGOUT_RESPONSE     = 1004,
-    CHAT_MESSAGE        = 1005,
-    JOIN_ROOM           = 1006,
-    LEAVE_ROOM          = 1007,
-    CREATE_ROOM_REQUEST  = 1008,
+    LOGIN_PROMPT = 1000,
+    LOGIN_REQUEST = 1001,
+    LOGIN_RESPONSE = 1002,
+    LOGOUT_REQUEST = 1003,
+    LOGOUT_RESPONSE = 1004,
+    CHAT_MESSAGE = 1005,
+    JOIN_ROOM = 1006,
+    LEAVE_ROOM = 1007,
+    CREATE_ROOM_REQUEST = 1008,
     CREATE_ROOM_RESPONSE = 1009,
-    ROOM_LIST_REQUEST   = 1010,
-    ROOM_LIST_RESPONSE  = 1011,
+    ROOM_LIST_REQUEST = 1010,
+    ROOM_LIST_RESPONSE = 1011,
     SERVER_NOTIFICATION = 1013,
-    REGISTER_REQUEST    = 1014,
-    REGISTER_RESPONSE   = 1015,
-    JOIN_ROOM_RESPONSE  = 1016,
+    REGISTER_REQUEST = 1014,
+    REGISTER_RESPONSE = 1015,
+    JOIN_ROOM_RESPONSE = 1016,
     LEAVE_ROOM_RESPONSE = 1017,
-    WHISPER_REQUEST     = 1018,
-    WHISPER_RESPONSE    = 1019,
-    WHISPER_NOTIFICATION= 1020,
-    RECONNECT_REQUEST   = 1021,
-    RECONNECT_RESPONSE  = 1022,
-    KICK_USER_REQUEST   = 1023,
-    KICK_USER_RESPONSE  = 1024,
+    WHISPER_REQUEST = 1018,
+    WHISPER_RESPONSE = 1019,
+    WHISPER_NOTIFICATION = 1020,
+    RECONNECT_REQUEST = 1021,
+    RECONNECT_RESPONSE = 1022,
+    KICK_USER_REQUEST = 1023,
+    KICK_USER_RESPONSE = 1024,
     KICKED_NOTIFICATION = 1025
 };
 
@@ -1115,21 +1115,20 @@ private:
 //=====================
 // ChatRoom 브로드캐스트 구현 (Lock-Free Strand로 세션 포스트)
 //=====================
-inline void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
+void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
 {
     boost::asio::post(strand_, [this, self = shared_from_this(), msg, sender_id]() {
         for (auto& [id, user] : users_)
         {
             if (auto session = user->GetSession().lock())
             {
-                // 세션 스레드로 비동기 post (Lock 없이 완전히 안전함)
                 session->SendMessage(&msg, sizeof(ChatMessage));
             }
         }
     });
 }
 
-inline void ChatRoom::BroadcastNotification(const std::string& notification_text, uint32_t except_user_id)
+void ChatRoom::BroadcastNotification(const std::string& notification_text, uint32_t except_user_id)
 {
     boost::asio::post(strand_, [this, self = shared_from_this(), notification_text, except_user_id]() {
         ServerNotification notif{};
@@ -1298,7 +1297,7 @@ private:
     uint32_t next_room_id_ = 1;
 };
 
-inline void ChatSession::Disconnect()
+void ChatSession::Disconnect()
 {
     if (is_disconnected_) return;
     is_disconnected_ = true;
@@ -1310,7 +1309,7 @@ inline void ChatSession::Disconnect()
     server_.OnSessionDisconnected(shared_from_this());
 }
 
-inline awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
+awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) co_return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
@@ -1766,7 +1765,7 @@ private:
 };
 
 // ChatServer 생성자 구현
-inline ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
+ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     : io_context_(io_context),
       strand_(boost::asio::make_strand(io_context)),
       acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
