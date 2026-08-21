@@ -86,7 +86,10 @@ enum class MessageType : uint16_t
     RECONNECT_RESPONSE = 1022,
     KICK_USER_REQUEST = 1023,
     KICK_USER_RESPONSE = 1024,
-    KICKED_NOTIFICATION = 1025
+    KICKED_NOTIFICATION = 1025,
+    TRANSFER_MASTER_REQUEST = 1026,
+    TRANSFER_MASTER_RESPONSE = 1027,
+    MASTER_CHANGED_NOTIFICATION = 1028
 };
 
 #pragma pack(push, 1)
@@ -262,6 +265,29 @@ struct KickedNotification
     PacketHeader header;
     uint32_t room_id;
     char reason[128];
+};
+
+struct TransferMasterRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t target_user_id;
+};
+
+struct TransferMasterResponse
+{
+    PacketHeader header;
+    bool success;
+    uint32_t target_user_id;
+    char error_message[128];
+};
+
+struct MasterChangedNotification
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t new_master_id;
+    char new_master_username[32];
 };
 #pragma pack(pop)
 
@@ -511,7 +537,6 @@ public:
 
         co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
             [this, username, password, result_ptr, executor](auto handler) {
-                // handler를 shared_ptr로 포장하여 std::function의 Copy-Constructible 조건 충족
                 auto shared_handler = std::make_shared<decltype(handler)>(std::move(handler));
 
                 db_mgr_->PostTask([username, password, result_ptr, executor, shared_handler](MYSQL* conn) {
@@ -552,7 +577,6 @@ public:
 
         co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
             [this, username, password, result_ptr, executor](auto handler) {
-                // handler를 shared_ptr로 포장하여 std::function의 Copy-Constructible 조건 충족
                 auto shared_handler = std::make_shared<decltype(handler)>(std::move(handler));
 
                 db_mgr_->PostTask([username, password, result_ptr, executor, shared_handler](MYSQL* conn) {
@@ -1052,11 +1076,35 @@ public:
         if (it == users_.end()) {
             co_return std::make_pair(false, "USER_NOT_IN_ROOM");
         }
+
         std::string username = it->second->GetUsername();
+        bool is_host = HasPermission(user_permissions_[user_id], RoomPermission::DELEGATE_HOST);
+
         users_.erase(it);
         user_permissions_.erase(user_id);
 
         BroadcastNotification(username + " left the room.", user_id);
+
+        // 방장이 퇴장했고 남은 유저가 있는 경우 방장 권한 자동 위임
+        if (is_host && !users_.empty())
+        {
+            auto next_master_it = users_.begin();
+            uint32_t next_master_id = next_master_it->first;
+            std::string next_master_name = next_master_it->second->GetUsername();
+
+            user_permissions_[next_master_id] = RoomPermission::HOST;
+
+            MasterChangedNotification notif{};
+            notif.header.packet_size = sizeof(MasterChangedNotification);
+            notif.header.message_type = MessageType::MASTER_CHANGED_NOTIFICATION;
+            notif.room_id = room_id_;
+            notif.new_master_id = next_master_id;
+            std::strncpy(notif.new_master_username, next_master_name.c_str(), sizeof(notif.new_master_username) - 1);
+
+            BroadcastRawData(&notif, sizeof(MasterChangedNotification));
+            BroadcastNotification(next_master_name + " is now the room host.");
+        }
+
         co_return std::make_pair(true, "");
     }
 
@@ -1106,8 +1154,45 @@ public:
         co_return std::make_pair(true, "");
     }
 
+    awaitable<std::pair<bool, std::string>> TransferMasterAsync(uint32_t operator_id, uint32_t target_id)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+
+        auto perm_it = user_permissions_.find(operator_id);
+        if (perm_it == user_permissions_.end() || !HasPermission(perm_it->second, RoomPermission::DELEGATE_HOST)) {
+            co_return std::make_pair(false, "PERMISSION_DENIED");
+        }
+
+        auto target_it = users_.find(target_id);
+        if (target_it == users_.end()) {
+            co_return std::make_pair(false, "TARGET_NOT_IN_ROOM");
+        }
+
+        if (operator_id == target_id) {
+            co_return std::make_pair(false, "CANNOT_TRANSFER_SELF");
+        }
+
+        user_permissions_[operator_id] = RoomPermission::MEMBER;
+        user_permissions_[target_id] = RoomPermission::HOST;
+
+        std::string new_master_name = target_it->second->GetUsername();
+
+        MasterChangedNotification notif{};
+        notif.header.packet_size = sizeof(MasterChangedNotification);
+        notif.header.message_type = MessageType::MASTER_CHANGED_NOTIFICATION;
+        notif.room_id = room_id_;
+        notif.new_master_id = target_id;
+        std::strncpy(notif.new_master_username, new_master_name.c_str(), sizeof(notif.new_master_username) - 1);
+
+        BroadcastRawData(&notif, sizeof(MasterChangedNotification));
+        BroadcastNotification(new_master_name + " is now the new room host.");
+
+        co_return std::make_pair(true, "");
+    }
+
     void BroadcastMessage(const ChatMessage& msg, uint32_t sender_id);
     void BroadcastNotification(const std::string& notification_text, uint32_t except_user_id = 0);
+    void BroadcastRawData(const void* data, size_t size, uint32_t except_user_id = 0);
 
 private:
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
@@ -1150,6 +1235,20 @@ void ChatRoom::BroadcastNotification(const std::string& notification_text, uint3
             if (auto session = user->GetSession().lock())
             {
                 session->SendMessage(&notif, sizeof(ServerNotification));
+            }
+        }
+    });
+}
+
+void ChatRoom::BroadcastRawData(const void* data, size_t size, uint32_t except_user_id)
+{
+    boost::asio::post(strand_, [this, self = shared_from_this(), data_vec = std::vector<char>(static_cast<const char*>(data), static_cast<const char*>(data) + size), except_user_id]() {
+        for (auto& [id, user] : users_)
+        {
+            if (id == except_user_id) continue;
+            if (auto session = user->GetSession().lock())
+            {
+                session->SendMessage(data_vec.data(), data_vec.size());
             }
         }
     });
@@ -1288,7 +1387,6 @@ public:
     }
 
 private:
-    boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     tcp::acceptor acceptor_;
     MessageDispatcher dispatcher_;
@@ -1578,6 +1676,46 @@ private:
     ChatServer& server_;
 };
 
+class TransferMasterHandler : public IMessageHandler
+{
+public:
+    explicit TransferMasterHandler(ChatServer& server) : server_(server) {}
+
+    awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
+    {
+        if (!session->IsAuthenticated() || size < sizeof(TransferMasterRequest)) co_return;
+        const auto& req = *reinterpret_cast<const TransferMasterRequest*>(data);
+
+        auto room = co_await server_.GetRoomAsync(req.room_id);
+
+        TransferMasterResponse res{};
+        res.header.message_type = MessageType::TRANSFER_MASTER_RESPONSE;
+        res.header.packet_size = sizeof(TransferMasterResponse);
+        res.target_user_id = req.target_user_id;
+
+        if (!room)
+        {
+            res.success = false;
+            std::strncpy(res.error_message, "ROOM_NOT_FOUND", sizeof(res.error_message) - 1);
+            session->SendMessage(&res, sizeof(TransferMasterResponse));
+            co_return;
+        }
+
+        auto [success, err] = co_await room->TransferMasterAsync(session->GetUserId(), req.target_user_id);
+        res.success = success;
+        if (!success) {
+            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+        }
+
+        if (!session->IsDisconnected()) {
+            session->SendMessage(&res, sizeof(TransferMasterResponse));
+        }
+    }
+
+private:
+    ChatServer& server_;
+};
+
 class RoomListHandler : public IMessageHandler
 {
 public:
@@ -1791,6 +1929,7 @@ ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     dispatcher_.RegisterHandler(MessageType::WHISPER_REQUEST, std::make_unique<WhisperHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::RECONNECT_REQUEST, std::make_unique<ReconnectHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::KICK_USER_REQUEST, std::make_unique<KickUserHandler>(*this));
+    dispatcher_.RegisterHandler(MessageType::TRANSFER_MASTER_REQUEST, std::make_unique<TransferMasterHandler>(*this));
 }
 
 //=====================
