@@ -17,234 +17,70 @@
 using boost::asio::ip::tcp;
 
 // =========================================================
-// 프로토콜 정의
+// 프로토콜 정의 (서버 1:1 동기화 완료)
 // =========================================================
 enum class MessageType : uint16_t
 {
-    LOGIN_PROMPT = 1000,
-    LOGIN_REQUEST = 1001,
-    LOGIN_RESPONSE = 1002,
-    LOGOUT_REQUEST = 1003,
-    LOGOUT_RESPONSE = 1004,
-    CHAT_MESSAGE = 1005,
-    JOIN_ROOM = 1006,
-    LEAVE_ROOM = 1007,
-    CREATE_ROOM_REQUEST = 1008,
-    CREATE_ROOM_RESPONSE = 1009,
-    ROOM_LIST_REQUEST = 1010,
-    ROOM_LIST_RESPONSE = 1011,
-    SERVER_NOTIFICATION = 1013,
-    REGISTER_REQUEST = 1014,
-    REGISTER_RESPONSE = 1015,
-    JOIN_ROOM_RESPONSE = 1016,
-    LEAVE_ROOM_RESPONSE = 1017,
-    WHISPER_REQUEST = 1018,
-    WHISPER_RESPONSE = 1019,
-    WHISPER_NOTIFICATION = 1020,
-    RECONNECT_REQUEST = 1021,
-    RECONNECT_RESPONSE = 1022,
-
-    // 방장 시스템 확장 패킷
-    KICK_USER_REQUEST = 1023,
-    KICK_USER_RESPONSE = 1024,
-    TRANSFER_MASTER_REQUEST = 1025,
-    TRANSFER_MASTER_RESPONSE = 1026,
-    ROOM_MASTER_CHANGED_NOTIFICATION = 1027
+    LOGIN_PROMPT                = 1000,
+    LOGIN_REQUEST               = 1001,
+    LOGIN_RESPONSE              = 1002,
+    LOGOUT_REQUEST              = 1003,
+    LOGOUT_RESPONSE             = 1004,
+    CHAT_MESSAGE                = 1005,
+    JOIN_ROOM                   = 1006,
+    LEAVE_ROOM                  = 1007,
+    CREATE_ROOM_REQUEST         = 1008,
+    CREATE_ROOM_RESPONSE        = 1009,
+    ROOM_LIST_REQUEST           = 1010,
+    ROOM_LIST_RESPONSE          = 1011,
+    SERVER_NOTIFICATION         = 1013,
+    REGISTER_REQUEST            = 1014,
+    REGISTER_RESPONSE           = 1015,
+    JOIN_ROOM_RESPONSE          = 1016,
+    LEAVE_ROOM_RESPONSE         = 1017,
+    WHISPER_REQUEST             = 1018,
+    WHISPER_RESPONSE            = 1019,
+    WHISPER_NOTIFICATION        = 1020,
+    RECONNECT_REQUEST           = 1021,
+    RECONNECT_RESPONSE          = 1022,
+    KICK_USER_REQUEST           = 1023,
+    KICK_USER_RESPONSE          = 1024,
+    KICKED_NOTIFICATION         = 1025,
+    TRANSFER_MASTER_REQUEST     = 1026,
+    TRANSFER_MASTER_RESPONSE    = 1027,
+    MASTER_CHANGED_NOTIFICATION = 1028
 };
 
-enum class AuthStatus
-{
-    NONE,
-    WAITING,
-    SUCCESS,
-    FAILED
-};
+enum class AuthStatus { NONE, WAITING, SUCCESS, FAILED };
 
 #pragma pack(push, 1)
-struct PacketHeader
-{
-    uint16_t packet_size;
-    MessageType message_type;
-    uint32_t user_id;
-    uint32_t sequence_number;
-};
-
-struct LoginRequest
-{
-    PacketHeader header;
-    char username[32];
-    char password[64];
-};
-
-struct LoginResponse
-{
-    PacketHeader header;
-    bool success;
-    uint32_t assigned_user_id;
-    char reconnect_token[64];
-    char error_message[128];
-};
-
-struct RegisterRequest
-{
-    PacketHeader header;
-    char username[32];
-    char password[64];
-};
-
-struct RegisterResponse
-{
-    PacketHeader header;
-    bool success;
-    uint32_t assigned_user_id;
-    char error_message[128];
-};
-
-struct ChatMessage
-{
-    PacketHeader header;
-    uint32_t room_id;
-    char message[512];
-};
-
-struct RoomInfo
-{
-    uint32_t room_id;
-    char room_name[32];
-    uint32_t current_users;
-    uint32_t max_users;
-    uint32_t owner_id; // [확장] 방장 유저 ID
-};
-
-struct CreateRoomRequest
-{
-    PacketHeader header;
-    char room_name[32];
-    uint32_t max_users;
-};
-
-struct CreateRoomResponse
-{
-    PacketHeader header;
-    bool success;
-    uint32_t created_room_id;
-    char error_message[128];
-};
-
-struct RoomListRequest
-{
-    PacketHeader header;
-};
-
-struct RoomListResponse
-{
-    PacketHeader header;
-    uint32_t room_count;
-    RoomInfo rooms[16];
-};
-
-struct JoinRoomRequest
-{
-    PacketHeader header;
-    uint32_t room_id;
-};
-
-struct JoinRoomResponse
-{
-    PacketHeader header;
-    bool success;
-    uint32_t room_id;
-    uint32_t owner_id; // [확장] 방장 ID 수신
-    char error_message[128];
-};
-
-struct LeaveRoomRequest
-{
-    PacketHeader header;
-    uint32_t room_id;
-};
-
-struct LeaveRoomResponse
-{
-    PacketHeader header;
-    bool success;
-    char error_message[128];
-};
-
-struct WhisperRequest
-{
-    PacketHeader header;
-    uint32_t room_id;
-    char target_username[32];
-    char message[512];
-};
-
-struct WhisperResponse
-{
-    PacketHeader header;
-    bool success;
-    char error_message[128];
-};
-
-struct WhisperNotification
-{
-    PacketHeader header;
-    char sender_username[32];
-    char message[512];
-};
-
-struct ReconnectRequest
-{
-    PacketHeader header;
-    uint32_t user_id;
-    char reconnect_token[64];
-    uint32_t last_room_id;
-};
-
-struct ReconnectResponse
-{
-    PacketHeader header;
-    bool success;
-    uint32_t restored_room_id;
-    uint32_t owner_id; // [확장] 방 복구 시 방장 정보 수신
-    char error_message[128];
-};
-
-// --- 방장 시스템 확장 구조체 ---
-struct KickUserRequest
-{
-    PacketHeader header;
-    uint32_t room_id;
-    uint32_t target_user_id;
-};
-
-struct KickUserResponse
-{
-    PacketHeader header;
-    bool success;
-    char error_message[128];
-};
-
-struct TransferMasterRequest
-{
-    PacketHeader header;
-    uint32_t room_id;
-    uint32_t target_user_id;
-};
-
-struct TransferMasterResponse
-{
-    PacketHeader header;
-    bool success;
-    char error_message[128];
-};
-
-struct RoomMasterChangedNotification
-{
-    PacketHeader header;
-    uint32_t room_id;
-    uint32_t new_owner_id;
-};
+struct PacketHeader { uint16_t packet_size; MessageType message_type; uint32_t user_id; uint32_t sequence_number; };
+struct LoginRequest { PacketHeader header; char username[32]; char password[64]; };
+struct LoginResponse { PacketHeader header; bool success; uint32_t assigned_user_id; char reconnect_token[64]; char error_message[128]; };
+struct RegisterRequest { PacketHeader header; char username[32]; char password[64]; };
+struct RegisterResponse { PacketHeader header; bool success; uint32_t assigned_user_id; char error_message[128]; };
+struct ChatMessage { PacketHeader header; uint32_t room_id; char message[512]; };
+struct ServerNotification { PacketHeader header; char message[256]; };
+struct RoomInfo { uint32_t room_id; char room_name[32]; uint32_t current_users; uint32_t max_users; uint32_t owner_id; };
+struct CreateRoomRequest { PacketHeader header; char room_name[32]; uint32_t max_users; };
+struct CreateRoomResponse { PacketHeader header; bool success; uint32_t created_room_id; char error_message[128]; };
+struct RoomListRequest { PacketHeader header; };
+struct RoomListResponse { PacketHeader header; uint32_t room_count; RoomInfo rooms[16]; };
+struct JoinRoomRequest { PacketHeader header; uint32_t room_id; };
+struct JoinRoomResponse { PacketHeader header; bool success; uint32_t room_id; uint32_t owner_id; char error_message[128]; };
+struct LeaveRoomRequest { PacketHeader header; uint32_t room_id; };
+struct LeaveRoomResponse { PacketHeader header; bool success; char error_message[128]; };
+struct WhisperRequest { PacketHeader header; uint32_t room_id; char target_username[32]; char message[512]; };
+struct WhisperResponse { PacketHeader header; bool success; char error_message[128]; };
+struct WhisperNotification { PacketHeader header; char sender_username[32]; char message[512]; };
+struct ReconnectRequest { PacketHeader header; uint32_t user_id; char reconnect_token[64]; uint32_t last_room_id; };
+struct ReconnectResponse { PacketHeader header; bool success; uint32_t restored_room_id; uint32_t owner_id; char error_message[128]; };
+struct KickUserRequest { PacketHeader header; uint32_t room_id; uint32_t target_user_id; };
+struct KickUserResponse { PacketHeader header; bool success; uint32_t target_user_id; char error_message[128]; };
+struct KickedNotification { PacketHeader header; uint32_t room_id; char reason[128]; };
+struct TransferMasterRequest { PacketHeader header; uint32_t room_id; uint32_t target_user_id; };
+struct TransferMasterResponse { PacketHeader header; bool success; uint32_t target_user_id; char error_message[128]; };
+struct MasterChangedNotification { PacketHeader header; uint32_t room_id; uint32_t new_master_id; char new_master_username[32]; };
 #pragma pack(pop)
 
 class ChatClient;
@@ -380,13 +216,17 @@ public:
     void SetLastRoomId(uint32_t room_id) { last_room_id_ = room_id; }
     uint32_t GetLastRoomId() const { return last_room_id_; }
 
-    // 방장 정보 관리 함수
     void SetCurrentRoomOwnerId(uint32_t owner_id) { current_room_owner_id_ = owner_id; }
     uint32_t GetCurrentRoomOwnerId() const { return current_room_owner_id_; }
     bool IsRoomOwner() const { return user_id_ != 0 && user_id_ == current_room_owner_id_; }
 
     bool IsConnected() const { return is_connected_; }
     bool IsConnectFailed() const { return connect_failed_; }
+
+    void BeginRoomOperation() { room_operation_pending_ = true; room_operation_success_ = false; }
+    void CompleteRoomOperation(bool success) { room_operation_success_ = success; room_operation_pending_ = false; }
+    bool IsRoomOperationPending() const { return room_operation_pending_; }
+    bool IsRoomOperationSuccessful() const { return room_operation_success_; }
 
 private:
     void DoConnect()
@@ -484,6 +324,7 @@ private:
     {
         if (size < sizeof(PacketHeader)) return;
         const auto& header = *reinterpret_cast<const PacketHeader*>(data);
+        if (header.packet_size != size || header.packet_size < sizeof(PacketHeader)) return;
         dispatcher_.DispatchMessage(shared_from_this(), header, data, size);
     }
 
@@ -521,7 +362,9 @@ private:
 
     std::string reconnect_token_;
     std::atomic<uint32_t> last_room_id_{0};
-    std::atomic<uint32_t> current_room_owner_id_{0}; // 현재 속한 방의 방장 ID
+    std::atomic<uint32_t> current_room_owner_id_{0};
+    std::atomic<bool> room_operation_pending_{false};
+    std::atomic<bool> room_operation_success_{false};
 
     boost::asio::steady_timer reconnect_timer_{io_context_};
 
@@ -594,6 +437,8 @@ public:
     {
         if (size < sizeof(ChatMessage)) return;
         const auto& msg = *reinterpret_cast<const ChatMessage*>(data);
+        
+        // 서버 프로토콜에는 sender 문자열이 없으므로 user_id를 표시한다.
         std::cout << "\n[User " << msg.header.user_id << "]: " << msg.message << std::endl;
         std::cout << "Message: " << std::flush;
     }
@@ -604,8 +449,10 @@ class ServerNotificationHandler : public IMessageHandler
 public:
     void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
     {
-        std::string notice(data + sizeof(PacketHeader), size - sizeof(PacketHeader));
-        std::cout << "\n[Notification] " << notice << std::endl;
+        // [수정] ServerNotification 구조체로 안전하게 역직렬화
+        if (size < sizeof(ServerNotification)) return;
+        const auto& notif = *reinterpret_cast<const ServerNotification*>(data);
+        std::cout << "\n[Notification] " << notif.message << std::endl;
         std::cout << "Message: " << std::flush;
     }
 };
@@ -620,11 +467,16 @@ public:
 
         if (res.success)
         {
+            client->SetLastRoomId(res.created_room_id);
+            client->SetCurrentRoomOwnerId(client->GetUserId());
             std::cout << "\n[System] Room Created Successfully! Room ID: " << res.created_room_id << std::endl;
+            std::cout << "[System] You are now the Room Leader." << std::endl;
+            client->CompleteRoomOperation(true);
         }
         else
         {
             std::cout << "\n[System] Failed to Create Room: " << res.error_message << std::endl;
+            client->CompleteRoomOperation(false);
         }
     }
 };
@@ -666,10 +518,12 @@ public:
             {
                 std::cout << "[System] You are the Room Leader of this room." << std::endl;
             }
+            client->CompleteRoomOperation(true);
         }
         else
         {
             std::cout << "\n[System] Failed to join room: " << res.error_message << std::endl;
+            client->CompleteRoomOperation(false);
         }
     }
 };
@@ -759,7 +613,6 @@ public:
     }
 };
 
-// --- 방장 시스템 전용 응답 및 알림 핸들러 ---
 class KickUserResponseHandler : public IMessageHandler
 {
 public:
@@ -800,16 +653,16 @@ public:
     }
 };
 
-class RoomMasterChangedNotificationHandler : public IMessageHandler
+class MasterChangedNotificationHandler : public IMessageHandler
 {
 public:
     void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
     {
-        if (size < sizeof(RoomMasterChangedNotification)) return;
-        const auto& notif = *reinterpret_cast<const RoomMasterChangedNotification*>(data);
+        if (size < sizeof(MasterChangedNotification)) return;
+        const auto& notif = *reinterpret_cast<const MasterChangedNotification*>(data);
 
-        client->SetCurrentRoomOwnerId(notif.new_owner_id);
-        std::cout << "\n[System] Room Leader changed to User ID: " << notif.new_owner_id << std::endl;
+        client->SetCurrentRoomOwnerId(notif.new_master_id);
+        std::cout << "\n[System] Room Leader changed to User ID: " << notif.new_master_id << std::endl;
         if (client->IsRoomOwner())
         {
             std::cout << "[System] You are now the Room Leader! (/kick, /pass commands available)" << std::endl;
@@ -818,8 +671,20 @@ public:
     }
 };
 
+class KickedNotificationHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        client->SetLastRoomId(0);
+        client->SetCurrentRoomOwnerId(0);
+        std::cout << "\n[System] You have been kicked from the room by the host!" << std::endl;
+        std::cout << "[System] Returning to Lobby menu..." << std::endl;
+    }
+};
+
 // =========================================================
-// ChatClient 생성자 (핸들러 바인딩)
+// ChatClient 생성자
 // =========================================================
 ChatClient::ChatClient(boost::asio::io_context& io_context)
     : io_context_(io_context), socket_(io_context), read_buffer_(4096)
@@ -840,30 +705,149 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
 
     dispatcher_.RegisterHandler(MessageType::RECONNECT_RESPONSE, std::make_unique<ReconnectResponseHandler>());
 
-    // 방장 확장 핸들러 등록
     dispatcher_.RegisterHandler(MessageType::KICK_USER_RESPONSE, std::make_unique<KickUserResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::TRANSFER_MASTER_RESPONSE, std::make_unique<TransferMasterResponseHandler>());
-    dispatcher_.RegisterHandler(MessageType::ROOM_MASTER_CHANGED_NOTIFICATION, std::make_unique<RoomMasterChangedNotificationHandler>());
+    dispatcher_.RegisterHandler(MessageType::MASTER_CHANGED_NOTIFICATION, std::make_unique<MasterChangedNotificationHandler>());
+    dispatcher_.RegisterHandler(MessageType::KICKED_NOTIFICATION, std::make_unique<KickedNotificationHandler>());
 }
 
 // =========================================================
-// main() - CLI 메뉴 및 동기화 제어
+// 방 채팅 루프
+// =========================================================
+static void RunRoomChatLoop(const std::shared_ptr<ChatClient>& client)
+{
+    const uint32_t target_room_id = client->GetLastRoomId();
+    if (target_room_id == 0) return;
+
+    std::cout << "\n==========================================" << std::endl;
+    std::cout << " Entered Room [" << target_room_id << "]" << std::endl;
+    std::cout << " Whisper Usage: /w <Username> <Message>" << std::endl;
+    std::cout << " Host Commands: /kick <User_ID>, /pass <User_ID>" << std::endl;
+    std::cout << " Type '/quit' or '/exit' to leave room." << std::endl;
+    std::cout << "==========================================" << std::endl;
+
+    std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+    std::string line;
+
+    while (client->IsConnected())
+    {
+        if (client->GetLastRoomId() != target_room_id)
+            break;
+
+        std::cout << "Message: ";
+        if (!std::getline(std::cin, line)) break;
+        if (line.empty()) continue;
+
+        if (line == "/quit" || line == "/exit")
+        {
+            LeaveRoomRequest req{};
+            req.header.packet_size = sizeof(req);
+            req.header.message_type = MessageType::LEAVE_ROOM;
+            req.header.user_id = client->GetUserId();
+            req.room_id = target_room_id;
+            client->Send(&req, sizeof(req));
+            break;
+        }
+
+        if (line.rfind("/kick ", 0) == 0)
+        {
+            if (!client->IsRoomOwner())
+            {
+                std::cout << "[System] Only the room leader can kick users." << std::endl;
+                continue;
+            }
+            std::stringstream ss(line);
+            std::string cmd;
+            uint32_t target_user_id = 0;
+            ss >> cmd >> target_user_id;
+            if (target_user_id == 0)
+            {
+                std::cout << "[System] Usage: /kick <user_id>" << std::endl;
+                continue;
+            }
+            KickUserRequest req{};
+            req.header.packet_size = sizeof(req);
+            req.header.message_type = MessageType::KICK_USER_REQUEST;
+            req.header.user_id = client->GetUserId();
+            req.room_id = target_room_id;
+            req.target_user_id = target_user_id;
+            client->Send(&req, sizeof(req));
+            continue;
+        }
+
+        if (line.rfind("/pass ", 0) == 0)
+        {
+            if (!client->IsRoomOwner())
+            {
+                std::cout << "[System] Only the room leader can transfer leadership." << std::endl;
+                continue;
+            }
+            std::stringstream ss(line);
+            std::string cmd;
+            uint32_t target_user_id = 0;
+            ss >> cmd >> target_user_id;
+            if (target_user_id == 0)
+            {
+                std::cout << "[System] Usage: /pass <user_id>" << std::endl;
+                continue;
+            }
+            TransferMasterRequest req{};
+            req.header.packet_size = sizeof(req);
+            req.header.message_type = MessageType::TRANSFER_MASTER_REQUEST;
+            req.header.user_id = client->GetUserId();
+            req.room_id = target_room_id;
+            req.target_user_id = target_user_id;
+            client->Send(&req, sizeof(req));
+            continue;
+        }
+
+        if (line.rfind("/w ", 0) == 0 || line.rfind("/whisper ", 0) == 0)
+        {
+            std::stringstream ss(line);
+            std::string cmd, target_user, msg_body;
+            ss >> cmd >> target_user;
+            std::getline(ss >> std::ws, msg_body);
+            if (target_user.empty() || msg_body.empty())
+            {
+                std::cout << "[System] Usage: /w <Username> <Message>" << std::endl;
+                continue;
+            }
+            WhisperRequest req{};
+            req.header.packet_size = sizeof(req);
+            req.header.message_type = MessageType::WHISPER_REQUEST;
+            req.header.user_id = client->GetUserId();
+            req.room_id = target_room_id;
+            std::strncpy(req.target_username, target_user.c_str(), sizeof(req.target_username) - 1);
+            std::strncpy(req.message, msg_body.c_str(), sizeof(req.message) - 1);
+            client->Send(&req, sizeof(req));
+            continue;
+        }
+
+        ChatMessage msg{};
+        msg.header.packet_size = sizeof(msg);
+        msg.header.message_type = MessageType::CHAT_MESSAGE;
+        msg.header.user_id = client->GetUserId();
+        msg.room_id = target_room_id;
+        std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
+        client->Send(&msg, sizeof(msg));
+    }
+}
+
+// =========================================================
+// main() - CLI 루프 및 통신 처리
 // =========================================================
 int main()
 {
     boost::asio::io_context io_context;
-
     auto client = std::make_shared<ChatClient>(io_context);
+
     std::cout << "[System] Connecting to server..." << std::endl;
     client->Start("127.0.0.1", "8080");
 
     std::thread t([&io_context]() { io_context.run(); });
 
-    // 1. 소켓 연결 대기
     while (!client->IsConnected() && !client->IsConnectFailed())
-    {
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
-    }
 
     if (client->IsConnectFailed())
     {
@@ -873,248 +857,136 @@ int main()
         return 0;
     }
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    // 2. 인증 메뉴 루프
-    while (client->GetAuthStatus() != AuthStatus::SUCCESS)
+    while (client->GetAuthStatus() != AuthStatus::SUCCESS && client->IsConnected())
     {
-        std::cout << "\n=========================" << std::endl;
-        std::cout << " 1. Register (회원가입)" << std::endl;
-        std::cout << " 2. Login (로그인)" << std::endl;
-        std::cout << " 3. Exit (종료)" << std::endl;
-        std::cout << "Select Menu: ";
+        std::cout << "\n=========================\n"
+                  << " 1. Register (회원가입)\n"
+                  << " 2. Login (로그인)\n"
+                  << " 3. Exit (종료)\n"
+                  << "Select Menu: ";
 
         int choice = 0;
         if (!(std::cin >> choice)) break;
-
-        if (choice == 3)
-        {
-            io_context.stop();
-            if (t.joinable()) t.join();
-            return 0;
-        }
+        if (choice == 3) break;
+        if (choice != 1 && choice != 2) continue;
 
         std::string username, password;
-        std::cout << "Username: ";
-        std::cin >> username;
-        std::cout << "Password: ";
-        std::cin >> password;
+        std::cout << "Username: "; std::cin >> username;
+        std::cout << "Password: "; std::cin >> password;
 
-        if (choice == 1) // 회원가입
+        if (choice == 1)
         {
             RegisterRequest req{};
-            req.header.packet_size = sizeof(RegisterRequest);
+            req.header.packet_size = sizeof(req);
             req.header.message_type = MessageType::REGISTER_REQUEST;
             std::strncpy(req.username, username.c_str(), sizeof(req.username) - 1);
             std::strncpy(req.password, password.c_str(), sizeof(req.password) - 1);
-
             client->SetAuthStatus(AuthStatus::WAITING);
-            client->Send(&req, sizeof(RegisterRequest));
+            client->Send(&req, sizeof(req));
         }
-        else if (choice == 2) // 로그인
+        else
         {
             LoginRequest req{};
-            req.header.packet_size = sizeof(LoginRequest);
+            req.header.packet_size = sizeof(req);
             req.header.message_type = MessageType::LOGIN_REQUEST;
             std::strncpy(req.username, username.c_str(), sizeof(req.username) - 1);
             std::strncpy(req.password, password.c_str(), sizeof(req.password) - 1);
-
             client->SetAuthStatus(AuthStatus::WAITING);
-            client->Send(&req, sizeof(LoginRequest));
+            client->Send(&req, sizeof(req));
         }
 
-        while (client->GetAuthStatus() == AuthStatus::WAITING)
-        {
+        while (client->GetAuthStatus() == AuthStatus::WAITING && client->IsConnected())
             std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
     }
 
-    // 3. 로비 메뉴 및 채팅 루프
-    bool is_running = true;
-    while (client->IsConnected() && is_running)
+    if (client->GetAuthStatus() != AuthStatus::SUCCESS)
     {
-        std::cout << "\n=== Lobby Menu ===" << std::endl;
-        std::cout << "1. Room List (방 목록 조회)" << std::endl;
-        std::cout << "2. Create Room (방 생성)" << std::endl;
-        std::cout << "3. Enter Room (방 입장)" << std::endl;
-        std::cout << "4. Exit (종료)" << std::endl;
-        std::cout << "Select: ";
+        io_context.stop();
+        if (t.joinable()) t.join();
+        return 0;
+    }
+
+    // 서버 로그인 시 Lobby(1)에 자동 등록하지만, 클라이언트 상태도 응답으로 동기화한다.
+    client->BeginRoomOperation();
+    JoinRoomRequest lobby_req{};
+    lobby_req.header.packet_size = sizeof(lobby_req);
+    lobby_req.header.message_type = MessageType::JOIN_ROOM;
+    lobby_req.header.user_id = client->GetUserId();
+    lobby_req.room_id = 1;
+    client->Send(&lobby_req, sizeof(lobby_req));
+    while (client->IsRoomOperationPending() && client->IsConnected())
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+    bool is_running = client->IsConnected();
+    while (is_running)
+    {
+        std::cout << "\n=== Lobby Menu ===\n"
+                  << "1. Room List (방 목록 조회)\n"
+                  << "2. Create Room (방 생성 -> 자동 입장)\n"
+                  << "3. Enter Room (방 입장)\n"
+                  << "4. Exit (종료)\n"
+                  << "Select: ";
 
         int choice = 0;
         if (!(std::cin >> choice)) break;
 
-        if (choice == 1) // 방 목록 요청
+        if (choice == 1)
         {
             RoomListRequest req{};
-            req.header.packet_size = sizeof(RoomListRequest);
+            req.header.packet_size = sizeof(req);
             req.header.message_type = MessageType::ROOM_LIST_REQUEST;
-            client->Send(&req, sizeof(RoomListRequest));
+            req.header.user_id = client->GetUserId();
+            client->Send(&req, sizeof(req));
             std::this_thread::sleep_for(std::chrono::milliseconds(200));
         }
-        else if (choice == 2) // 방 생성 요청
+        else if (choice == 2)
         {
             std::string room_name;
             uint32_t max_users = 10;
-            std::cout << "Enter Room Name: ";
-            std::cin >> room_name;
-            std::cout << "Max Users: ";
-            std::cin >> max_users;
+            std::cout << "Enter Room Name: "; std::cin >> room_name;
+            std::cout << "Max Users: "; std::cin >> max_users;
 
             CreateRoomRequest req{};
-            req.header.packet_size = sizeof(CreateRoomRequest);
+            req.header.packet_size = sizeof(req);
             req.header.message_type = MessageType::CREATE_ROOM_REQUEST;
+            req.header.user_id = client->GetUserId();
             std::strncpy(req.room_name, room_name.c_str(), sizeof(req.room_name) - 1);
             req.max_users = max_users;
 
-            client->Send(&req, sizeof(CreateRoomRequest));
-            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+            client->BeginRoomOperation();
+            client->Send(&req, sizeof(req));
+            while (client->IsRoomOperationPending() && client->IsConnected())
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            if (client->IsRoomOperationSuccessful() && client->GetLastRoomId() != 0)
+                RunRoomChatLoop(client);
         }
-        else if (choice == 3) // 특정 방 입장
+        else if (choice == 3)
         {
             uint32_t target_room_id = 1;
-            std::cout << "Enter Room ID to join (e.g. 1 for Lobby): ";
-            if (!(std::cin >> target_room_id)) target_room_id = 1;
-
-            JoinRoomRequest join_req{};
-            join_req.header.packet_size = sizeof(JoinRoomRequest);
-            join_req.header.message_type = MessageType::JOIN_ROOM;
-            join_req.header.user_id = client->GetUserId();
-            join_req.room_id = target_room_id;
-
-            client->Send(&join_req, sizeof(JoinRoomRequest));
-
-            std::cout << "\n==========================================" << std::endl;
-            std::cout << " Entered Room [" << target_room_id << "]" << std::endl;
-            std::cout << " Whisper Usage: /w <Username> <Message>" << std::endl;
-            std::cout << " Host Commands: /kick <User_ID>, /pass <User_ID>" << std::endl;
-            std::cout << " Type '/quit' or '/exit' to leave room." << std::endl;
-            std::cout << "==========================================" << std::endl;
-
-            std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-
-            std::string line;
-            while (client->IsConnected())
+            std::cout << "Enter Room ID to join: ";
+            if (!(std::cin >> target_room_id))
             {
-                std::cout << "Message: ";
-                if (!std::getline(std::cin, line)) break;
-
-                if (line == "/quit" || line == "/exit")
-                {
-                    LeaveRoomRequest leave_req{};
-                    leave_req.header.packet_size = sizeof(LeaveRoomRequest);
-                    leave_req.header.message_type = MessageType::LEAVE_ROOM;
-                    leave_req.header.user_id = client->GetUserId();
-                    leave_req.room_id = target_room_id;
-
-                    client->Send(&leave_req, sizeof(LeaveRoomRequest));
-                    client->SetLastRoomId(0);
-                    client->SetCurrentRoomOwnerId(0);
-                    std::cout << "[System] Left Room " << target_room_id << ", returning to Lobby menu..." << std::endl;
-                    break;
-                }
-
-                if (line.empty()) continue;
-
-                // --- 강퇴 명령어 (/kick <target_user_id>) ---
-                if (line.rfind("/kick ", 0) == 0)
-                {
-                    if (!client->IsRoomOwner())
-                    {
-                        std::cout << "[System] Only the room leader can kick users." << std::endl;
-                        continue;
-                    }
-
-                    std::stringstream ss(line);
-                    std::string cmd;
-                    uint32_t target_user_id = 0;
-                    ss >> cmd >> target_user_id;
-
-                    if (target_user_id == 0)
-                    {
-                        std::cout << "[System] Usage: /kick <user_id>" << std::endl;
-                        continue;
-                    }
-
-                    KickUserRequest req{};
-                    req.header.packet_size = sizeof(KickUserRequest);
-                    req.header.message_type = MessageType::KICK_USER_REQUEST;
-                    req.header.user_id = client->GetUserId();
-                    req.room_id = target_room_id;
-                    req.target_user_id = target_user_id;
-
-                    client->Send(&req, sizeof(KickUserRequest));
-                    continue;
-                }
-
-                // --- 방장 위임 명령어 (/pass <target_user_id>) ---
-                if (line.rfind("/pass ", 0) == 0)
-                {
-                    if (!client->IsRoomOwner())
-                    {
-                        std::cout << "[System] Only the room leader can transfer leadership." << std::endl;
-                        continue;
-                    }
-
-                    std::stringstream ss(line);
-                    std::string cmd;
-                    uint32_t target_user_id = 0;
-                    ss >> cmd >> target_user_id;
-
-                    if (target_user_id == 0)
-                    {
-                        std::cout << "[System] Usage: /pass <user_id>" << std::endl;
-                        continue;
-                    }
-
-                    TransferMasterRequest req{};
-                    req.header.packet_size = sizeof(TransferMasterRequest);
-                    req.header.message_type = MessageType::TRANSFER_MASTER_REQUEST;
-                    req.header.user_id = client->GetUserId();
-                    req.room_id = target_room_id;
-                    req.target_user_id = target_user_id;
-
-                    client->Send(&req, sizeof(TransferMasterRequest));
-                    continue;
-                }
-
-                // --- 귓속말 명령 처리 (/w 유저명 메시지) ---
-                if (line.rfind("/w ", 0) == 0 || line.rfind("/whisper ", 0) == 0)
-                {
-                    std::stringstream ss(line);
-                    std::string cmd, target_user, msg_body;
-                    ss >> cmd >> target_user;
-                    std::getline(ss >> std::ws, msg_body);
-
-                    if (target_user.empty() || msg_body.empty())
-                    {
-                        std::cout << "[System] Usage: /w <Username> <Message>" << std::endl;
-                        continue;
-                    }
-
-                    WhisperRequest req{};
-                    req.header.packet_size = sizeof(WhisperRequest);
-                    req.header.message_type = MessageType::WHISPER_REQUEST;
-                    req.header.user_id = client->GetUserId();
-                    req.room_id = target_room_id;
-                    std::strncpy(req.target_username, target_user.c_str(), sizeof(req.target_username) - 1);
-                    std::strncpy(req.message, msg_body.c_str(), sizeof(req.message) - 1);
-
-                    client->Send(&req, sizeof(WhisperRequest));
-                    continue;
-                }
-
-                // 일반 전체 채팅
-                ChatMessage msg{};
-                msg.header.packet_size = sizeof(ChatMessage);
-                msg.header.message_type = MessageType::CHAT_MESSAGE;
-                msg.header.user_id = client->GetUserId();
-                msg.room_id = target_room_id;
-                std::strncpy(msg.message, line.c_str(), sizeof(msg.message) - 1);
-
-                client->Send(&msg, sizeof(ChatMessage));
+                std::cin.clear();
+                std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
+                continue;
             }
+
+            JoinRoomRequest req{};
+            req.header.packet_size = sizeof(req);
+            req.header.message_type = MessageType::JOIN_ROOM;
+            req.header.user_id = client->GetUserId();
+            req.room_id = target_room_id;
+
+            client->BeginRoomOperation();
+            client->Send(&req, sizeof(req));
+            while (client->IsRoomOperationPending() && client->IsConnected())
+                std::this_thread::sleep_for(std::chrono::milliseconds(20));
+
+            if (client->IsRoomOperationSuccessful())
+                RunRoomChatLoop(client);
         }
-        else if (choice == 4) // 종료
+        else if (choice == 4)
         {
             is_running = false;
         }
@@ -1123,6 +995,5 @@ int main()
     std::cout << "[System] Disconnecting and shutting down..." << std::endl;
     io_context.stop();
     if (t.joinable()) t.join();
-
     return 0;
 }

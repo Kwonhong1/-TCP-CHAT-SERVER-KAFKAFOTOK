@@ -39,16 +39,16 @@ using boost::asio::detached;
 //=====================
 enum class RoomPermission : uint32_t
 {
-    NONE = 0,
-    CHAT = 1 << 0,          // 0x01: 일반 채팅
-    KICK_USER = 1 << 1,     // 0x02: 유저 강퇴
-    BAN_USER = 1 << 2,      // 0x04: 영구 차단
+    NONE          = 0,
+    CHAT          = 1 << 0, // 0x01: 일반 채팅
+    KICK_USER     = 1 << 1, // 0x02: 유저 강퇴
+    BAN_USER      = 1 << 2, // 0x04: 영구 차단
     CHANGE_CONFIG = 1 << 3, // 0x08: 방 설정 변경
     DELEGATE_HOST = 1 << 4, // 0x10: 방장 위임
 
     // 역할별 프리셋
     MEMBER = CHAT,
-    HOST = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
+    HOST   = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
 };
 
 inline RoomPermission operator|(RoomPermission a, RoomPermission b) {
@@ -59,36 +59,38 @@ inline bool HasPermission(RoomPermission user_perm, RoomPermission required_perm
     return (static_cast<uint32_t>(user_perm) & static_cast<uint32_t>(required_perm)) == static_cast<uint32_t>(required_perm);
 }
 
+//=====================
 // 메시지 타입 정의
+//=====================
 enum class MessageType : uint16_t
 {
-    LOGIN_PROMPT = 1000,
-    LOGIN_REQUEST = 1001,
-    LOGIN_RESPONSE = 1002,
-    LOGOUT_REQUEST = 1003,
-    LOGOUT_RESPONSE = 1004,
-    CHAT_MESSAGE = 1005,
-    JOIN_ROOM = 1006,
-    LEAVE_ROOM = 1007,
-    CREATE_ROOM_REQUEST = 1008,
-    CREATE_ROOM_RESPONSE = 1009,
-    ROOM_LIST_REQUEST = 1010,
-    ROOM_LIST_RESPONSE = 1011,
-    SERVER_NOTIFICATION = 1013,
-    REGISTER_REQUEST = 1014,
-    REGISTER_RESPONSE = 1015,
-    JOIN_ROOM_RESPONSE = 1016,
-    LEAVE_ROOM_RESPONSE = 1017,
-    WHISPER_REQUEST = 1018,
-    WHISPER_RESPONSE = 1019,
-    WHISPER_NOTIFICATION = 1020,
-    RECONNECT_REQUEST = 1021,
-    RECONNECT_RESPONSE = 1022,
-    KICK_USER_REQUEST = 1023,
-    KICK_USER_RESPONSE = 1024,
-    KICKED_NOTIFICATION = 1025,
-    TRANSFER_MASTER_REQUEST = 1026,
-    TRANSFER_MASTER_RESPONSE = 1027,
+    LOGIN_PROMPT               = 1000,
+    LOGIN_REQUEST              = 1001,
+    LOGIN_RESPONSE             = 1002,
+    LOGOUT_REQUEST             = 1003,
+    LOGOUT_RESPONSE            = 1004,
+    CHAT_MESSAGE               = 1005,
+    JOIN_ROOM                  = 1006,
+    LEAVE_ROOM                 = 1007,
+    CREATE_ROOM_REQUEST        = 1008,
+    CREATE_ROOM_RESPONSE       = 1009,
+    ROOM_LIST_REQUEST          = 1010,
+    ROOM_LIST_RESPONSE         = 1011,
+    SERVER_NOTIFICATION        = 1013,
+    REGISTER_REQUEST           = 1014,
+    REGISTER_RESPONSE          = 1015,
+    JOIN_ROOM_RESPONSE         = 1016,
+    LEAVE_ROOM_RESPONSE        = 1017,
+    WHISPER_REQUEST            = 1018,
+    WHISPER_RESPONSE           = 1019,
+    WHISPER_NOTIFICATION       = 1020,
+    RECONNECT_REQUEST          = 1021,
+    RECONNECT_RESPONSE         = 1022,
+    KICK_USER_REQUEST          = 1023,
+    KICK_USER_RESPONSE         = 1024,
+    KICKED_NOTIFICATION        = 1025,
+    TRANSFER_MASTER_REQUEST    = 1026,
+    TRANSFER_MASTER_RESPONSE   = 1027,
     MASTER_CHANGED_NOTIFICATION = 1028
 };
 
@@ -151,6 +153,7 @@ struct RoomInfo
     char room_name[32];
     uint32_t current_users;
     uint32_t max_users;
+    uint32_t owner_id;
 };
 
 struct CreateRoomRequest
@@ -191,6 +194,7 @@ struct JoinRoomResponse
     PacketHeader header;
     bool success;
     uint32_t room_id;
+    uint32_t owner_id;
     char error_message[128];
 };
 
@@ -242,6 +246,7 @@ struct ReconnectResponse
     PacketHeader header;
     bool success;
     uint32_t restored_room_id;
+    uint32_t owner_id;
     char error_message[128];
 };
 
@@ -302,7 +307,7 @@ class ChatServer;
 class ChatSession;
 
 //=====================
-// MySQL 데이터베이스 매니저 (Worker Thread 전용)
+// MySQL 데이터베이스 매니저
 //=====================
 class DatabaseManager
 {
@@ -320,7 +325,7 @@ public:
     }
 
     bool Init(const std::string& host, const std::string& user,
-        const std::string& pass, const std::string& dbname, unsigned int port = 3306)
+              const std::string& pass, const std::string& dbname, unsigned int port = 3306)
     {
         conn_ = mysql_init(nullptr);
         if (!conn_)
@@ -330,7 +335,7 @@ public:
         }
 
         if (!mysql_real_connect(conn_, host.c_str(), user.c_str(), pass.c_str(),
-            dbname.c_str(), port, nullptr, 0))
+                                dbname.c_str(), port, nullptr, 0))
         {
             std::cerr << "[DB Error] Connection failed: " << mysql_error(conn_) << "\n";
             mysql_close(conn_);
@@ -384,14 +389,14 @@ private:
 };
 
 //=====================
-// Redis 매니저 클래스 (Lock-Free Strand 사용)
+// Redis 매니저 클래스
 //=====================
 class RedisManager : public std::enable_shared_from_this<RedisManager>
 {
 public:
     explicit RedisManager(boost::asio::io_context& io_context)
         : strand_(boost::asio::make_strand(io_context)),
-        conn_(std::make_shared<boost::redis::connection>(strand_)) {}
+          conn_(std::make_shared<boost::redis::connection>(strand_)) {}
 
     boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
 
@@ -712,7 +717,7 @@ private:
 };
 
 //=====================
-// 세션 클래스 (Lock-Free Strand 기반)
+// 세션 클래스
 //=====================
 using MessageChannel = boost::asio::experimental::channel<void(boost::system::error_code, std::vector<char>)>;
 
@@ -721,9 +726,9 @@ class ChatSession : public std::enable_shared_from_this<ChatSession>
 public:
     ChatSession(tcp::socket socket, ChatServer& server)
         : strand_(boost::asio::make_strand(socket.get_executor())),
-        socket_(std::move(socket)), server_(server), user_id_(0),
-        is_authenticated_(false), is_disconnected_(false),
-        write_channel_(strand_, 100), idle_timer_(strand_) {}
+          socket_(std::move(socket)), server_(server), user_id_(0),
+          is_authenticated_(false), is_disconnected_(false),
+          write_channel_(strand_, 100), idle_timer_(strand_) {}
 
     ~ChatSession()
     {
@@ -876,8 +881,8 @@ class User : public std::enable_shared_from_this<User>
 public:
     User(boost::asio::io_context& io_context, uint32_t id, const std::string& username)
         : strand_(boost::asio::make_strand(io_context)),
-        id_(id), password_(0), username_(username), is_online_(false),
-        disconnect_timer_(strand_) {}
+          id_(id), password_(0), username_(username), is_online_(false),
+          disconnect_timer_(strand_) {}
 
     boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
 
@@ -962,7 +967,7 @@ private:
 };
 
 //=====================
-// 유저 매니저 (Lock-Free Strand 기반)
+// 유저 매니저
 //=====================
 class UserManager : public std::enable_shared_from_this<UserManager>
 {
@@ -1033,7 +1038,7 @@ private:
 };
 
 //=====================
-// 채팅방 (Lock-Free Strand 기반)
+// 채팅방
 //=====================
 class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
@@ -1054,6 +1059,8 @@ public:
 
         auto it = users_.find(user->GetId());
         if (it != users_.end()) {
+            // 이미 같은 방에 있는 사용자는 기존 권한을 유지한다.
+            // 특히 HOST가 일반 JOIN/RECONNECT 때문에 MEMBER로 강등되는 것을 방지한다.
             co_return std::make_pair(true, "");
         }
 
@@ -1085,7 +1092,6 @@ public:
 
         BroadcastNotification(username + " left the room.", user_id);
 
-        // 방장이 퇴장했고 남은 유저가 있는 경우 방장 권한 자동 위임
         if (is_host && !users_.empty())
         {
             auto next_master_it = users_.begin();
@@ -1097,6 +1103,8 @@ public:
             MasterChangedNotification notif{};
             notif.header.packet_size = sizeof(MasterChangedNotification);
             notif.header.message_type = MessageType::MASTER_CHANGED_NOTIFICATION;
+            notif.header.user_id = next_master_id;
+            notif.header.sequence_number = 0;
             notif.room_id = room_id_;
             notif.new_master_id = next_master_id;
             std::strncpy(notif.new_master_username, next_master_name.c_str(), sizeof(notif.new_master_username) - 1);
@@ -1106,6 +1114,17 @@ public:
         }
 
         co_return std::make_pair(true, "");
+    }
+
+    awaitable<uint32_t> GetOwnerIdAsync()
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+        for (const auto& [id, perm] : user_permissions_)
+        {
+            if (HasPermission(perm, RoomPermission::DELEGATE_HOST))
+                co_return id;
+        }
+        co_return 0;
     }
 
     awaitable<bool> CheckPermissionAsync(uint32_t user_id, RoomPermission required_perm)
@@ -1142,6 +1161,8 @@ public:
             KickedNotification notif{};
             notif.header.packet_size = sizeof(KickedNotification);
             notif.header.message_type = MessageType::KICKED_NOTIFICATION;
+            notif.header.user_id = target_id;
+            notif.header.sequence_number = 0;
             notif.room_id = room_id_;
             std::strncpy(notif.reason, "Kicked by room host.", sizeof(notif.reason) - 1);
             session->SendMessage(&notif, sizeof(KickedNotification));
@@ -1180,6 +1201,8 @@ public:
         MasterChangedNotification notif{};
         notif.header.packet_size = sizeof(MasterChangedNotification);
         notif.header.message_type = MessageType::MASTER_CHANGED_NOTIFICATION;
+        notif.header.user_id = target_id;
+        notif.header.sequence_number = 0;
         notif.room_id = room_id_;
         notif.new_master_id = target_id;
         std::strncpy(notif.new_master_username, new_master_name.c_str(), sizeof(notif.new_master_username) - 1);
@@ -1337,6 +1360,19 @@ public:
         }, detached);
     }
 
+    awaitable<uint32_t> CreateRoomWithIdAsync(uint32_t room_id, std::string name, uint32_t max_users)
+    {
+        co_await boost::asio::post(strand_, use_awaitable);
+
+        auto new_room = std::make_shared<ChatRoom>(io_context_, room_id, name, max_users);
+        rooms_[room_id] = new_room;
+        if (room_id >= next_room_id_) {
+            next_room_id_ = room_id + 1;
+        }
+        std::cout << "[Server] Room Created: " << name << " (ID: " << room_id << ")" << std::endl;
+        co_return room_id;
+    }
+
     awaitable<uint32_t> CreateRoomAsync(std::string name, uint32_t max_users)
     {
         co_await boost::asio::post(strand_, use_awaitable);
@@ -1360,6 +1396,7 @@ public:
             std::strncpy(info.room_name, room->GetName().c_str(), sizeof(info.room_name) - 1);
             info.current_users = room->GetCurrentUsers();
             info.max_users = room->GetMaxUsers();
+            info.owner_id = co_await room->GetOwnerIdAsync();
             room_list.push_back(info);
         }
         co_return room_list;
@@ -1386,7 +1423,10 @@ public:
         }, detached);
     }
 
+    const std::unordered_map<uint32_t, std::shared_ptr<ChatRoom>>& GetAllRooms() const { return rooms_; }
+
 private:
+    boost::asio::io_context& io_context_;
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     tcp::acceptor acceptor_;
     MessageDispatcher dispatcher_;
@@ -1417,6 +1457,7 @@ awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) co_return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
+    if (header.packet_size != size || header.packet_size < sizeof(PacketHeader)) co_return;
     co_await server_.GetDispatcher().DispatchMessageAsync(shared_from_this(), header, data, size);
 }
 
@@ -1445,9 +1486,11 @@ public:
         LoginResponse response{};
         response.header.message_type = MessageType::LOGIN_RESPONSE;
         response.header.packet_size = sizeof(LoginResponse);
+        response.header.sequence_number = request.header.sequence_number;
 
         if (!auth_result.success)
         {
+            response.header.user_id = 0;
             response.success = false;
             std::strncpy(response.error_message, "INVALID_CREDENTIALS", sizeof(response.error_message) - 1);
             session->SendMessage(&response, sizeof(LoginResponse));
@@ -1455,6 +1498,8 @@ public:
         }
 
         uint32_t user_id = auth_result.user_data.id;
+        response.header.user_id = user_id;
+
         auto user = co_await user_manager_.GetOrCreateMemoryUserAsync(user_id, username);
 
         if (user->IsOnline())
@@ -1464,6 +1509,8 @@ public:
                 ServerNotification kick_notif{};
                 kick_notif.header.packet_size = sizeof(ServerNotification);
                 kick_notif.header.message_type = MessageType::SERVER_NOTIFICATION;
+                kick_notif.header.user_id = user_id;
+                kick_notif.header.sequence_number = 0;
                 std::strncpy(kick_notif.message, "Logged in from another location.", sizeof(kick_notif.message) - 1);
                 old_session->SendMessage(&kick_notif, sizeof(ServerNotification));
                 old_session->Kick();
@@ -1486,6 +1533,7 @@ public:
         response.success = true;
         response.assigned_user_id = user_id;
 
+        // 클라이언트 로비(Room ID: 1) 자동 참가
         auto lobby = co_await server_.GetRoomAsync(1);
         if (lobby && !session->IsDisconnected())
         {
@@ -1524,14 +1572,17 @@ public:
         RegisterResponse response{};
         response.header.message_type = MessageType::REGISTER_RESPONSE;
         response.header.packet_size = sizeof(RegisterResponse);
+        response.header.sequence_number = request.header.sequence_number;
 
         if (reg_result.success)
         {
+            response.header.user_id = reg_result.assigned_id;
             response.success = true;
             response.assigned_user_id = reg_result.assigned_id;
         }
         else
         {
+            response.header.user_id = 0;
             response.success = false;
             std::strncpy(response.error_message, "REGISTER_FAILED_OR_DUPLICATE", sizeof(response.error_message) - 1);
         }
@@ -1560,6 +1611,8 @@ public:
         ReconnectResponse res{};
         res.header.message_type = MessageType::RECONNECT_RESPONSE;
         res.header.packet_size = sizeof(ReconnectResponse);
+        res.header.user_id = req.user_id;
+        res.header.sequence_number = req.header.sequence_number;
 
         if (!success || session->IsDisconnected())
         {
@@ -1579,14 +1632,24 @@ public:
         auto room = co_await server_.GetRoomAsync(req.last_room_id);
         if (room && !session->IsDisconnected())
         {
+            // 기존 방에 이미 있으면 기존 권한(HOST 포함)을 유지한다.
             auto [joined, join_err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
-            res.success = true;
-            res.restored_room_id = joined ? req.last_room_id : 0;
+            res.success = joined;
+            res.restored_room_id = joined ? req.last_room_id : 1;
+            res.owner_id = joined ? co_await room->GetOwnerIdAsync() : 0;
         }
         else
         {
-            res.success = true;
-            res.restored_room_id = 0;
+            auto lobby = co_await server_.GetRoomAsync(1);
+            bool joined_lobby = false;
+            if (lobby)
+            {
+                auto result = co_await lobby->AddUserAsync(user, RoomPermission::MEMBER);
+                joined_lobby = result.first;
+                if (joined_lobby) res.owner_id = co_await lobby->GetOwnerIdAsync();
+            }
+            res.success = joined_lobby;
+            res.restored_room_id = joined_lobby ? 1 : 0;
         }
 
         session->SendMessage(&res, sizeof(ReconnectResponse));
@@ -1607,21 +1670,38 @@ public:
         if (!session->IsAuthenticated() || size < sizeof(CreateRoomRequest)) co_return;
         const auto& req = *reinterpret_cast<const CreateRoomRequest*>(data);
 
+        auto user = co_await server_.GetUserManager().GetUserAsync(session->GetUserId());
+        if (!user || session->IsDisconnected()) co_return;
+
         uint32_t created_room_id = co_await server_.CreateRoomAsync(req.room_name, req.max_users);
         auto room = co_await server_.GetRoomAsync(created_room_id);
-        auto user = co_await server_.GetUserManager().GetUserAsync(session->GetUserId());
-
-        if (session->IsDisconnected()) co_return;
 
         CreateRoomResponse res{};
         res.header.message_type = MessageType::CREATE_ROOM_RESPONSE;
         res.header.packet_size = sizeof(CreateRoomResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
 
-        if (room && user)
+        if (room)
         {
-            co_await room->AddUserAsync(user, RoomPermission::HOST);
-            res.success = true;
-            res.created_room_id = created_room_id;
+            for (const auto& [id, r] : server_.GetAllRooms())
+            {
+                if (id != created_room_id)
+                {
+                    co_await r->RemoveUserAsync(user->GetId());
+                }
+            }
+
+            auto [joined, join_err] = co_await room->AddUserAsync(user, RoomPermission::HOST);
+            res.success = joined;
+            if (joined)
+            {
+                res.created_room_id = created_room_id;
+            }
+            else
+            {
+                std::strncpy(res.error_message, join_err.c_str(), sizeof(res.error_message) - 1);
+            }
         }
         else
         {
@@ -1629,7 +1709,10 @@ public:
             std::strncpy(res.error_message, "ROOM_CREATION_FAILED", sizeof(res.error_message) - 1);
         }
 
-        session->SendMessage(&res, sizeof(CreateRoomResponse));
+        if (!session->IsDisconnected())
+        {
+            session->SendMessage(&res, sizeof(CreateRoomResponse));
+        }
     }
 
 private:
@@ -1651,6 +1734,8 @@ public:
         KickUserResponse res{};
         res.header.message_type = MessageType::KICK_USER_RESPONSE;
         res.header.packet_size = sizeof(KickUserResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
         res.target_user_id = req.target_user_id;
 
         if (!room)
@@ -1691,6 +1776,8 @@ public:
         TransferMasterResponse res{};
         res.header.message_type = MessageType::TRANSFER_MASTER_RESPONSE;
         res.header.packet_size = sizeof(TransferMasterResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
         res.target_user_id = req.target_user_id;
 
         if (!room)
@@ -1724,6 +1811,7 @@ public:
     awaitable<void> HandleMessageAsync(std::shared_ptr<ChatSession> session, const char* data, size_t size) override
     {
         if (!session->IsAuthenticated() || size < sizeof(RoomListRequest)) co_return;
+        const auto& req = *reinterpret_cast<const RoomListRequest*>(data);
 
         auto list = co_await server_.GetRoomListAsync();
 
@@ -1732,6 +1820,8 @@ public:
         RoomListResponse res{};
         res.header.message_type = MessageType::ROOM_LIST_RESPONSE;
         res.header.packet_size = sizeof(RoomListResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
         res.room_count = static_cast<uint32_t>(std::min(list.size(), size_t(16)));
 
         for (size_t i = 0; i < res.room_count; ++i)
@@ -1782,6 +1872,8 @@ public:
         JoinRoomResponse res{};
         res.header.message_type = MessageType::JOIN_ROOM_RESPONSE;
         res.header.packet_size = sizeof(JoinRoomResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
         res.room_id = req.room_id;
 
         if (!room || !user)
@@ -1792,9 +1884,24 @@ public:
             co_return;
         }
 
+        for (const auto& [id, r] : server_.GetAllRooms())
+        {
+            if (id != req.room_id)
+            {
+                co_await r->RemoveUserAsync(user->GetId());
+            }
+        }
+
         auto [success, err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
         res.success = success;
-        if (!success) std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+        if (success)
+        {
+            res.owner_id = co_await room->GetOwnerIdAsync();
+        }
+        else
+        {
+            std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
+        }
 
         if (!session->IsDisconnected())
         {
@@ -1824,6 +1931,8 @@ public:
         LeaveRoomResponse res{};
         res.header.message_type = MessageType::LEAVE_ROOM_RESPONSE;
         res.header.packet_size = sizeof(LeaveRoomResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
 
         if (!room)
         {
@@ -1861,6 +1970,8 @@ public:
         WhisperResponse res{};
         res.header.message_type = MessageType::WHISPER_RESPONSE;
         res.header.packet_size = sizeof(WhisperResponse);
+        res.header.user_id = session->GetUserId();
+        res.header.sequence_number = req.header.sequence_number;
 
         auto sender_user = co_await user_manager_.GetUserAsync(session->GetUserId());
         auto target_user = co_await user_manager_.GetUserByUsernameAsync(req.target_username);
@@ -1888,6 +1999,8 @@ public:
             WhisperNotification notif{};
             notif.header.packet_size = sizeof(WhisperNotification);
             notif.header.message_type = MessageType::WHISPER_NOTIFICATION;
+            notif.header.user_id = target_user->GetId();
+            notif.header.sequence_number = 0;
             std::strncpy(notif.sender_username, sender_user->GetUsername().c_str(), sizeof(notif.sender_username) - 1);
             std::strncpy(notif.message, req.message, sizeof(notif.message) - 1);
 
@@ -1908,16 +2021,18 @@ private:
     ChatServer& server_;
 };
 
+//=====================
 // ChatServer 생성자 구현
+//=====================
 ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     : io_context_(io_context),
-    strand_(boost::asio::make_strand(io_context)),
-    acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
-    user_manager_(std::make_shared<UserManager>(io_context)),
-    redis_manager_(std::make_shared<RedisManager>(io_context)),
-    db_manager_(std::make_shared<DatabaseManager>()),
-    user_repository_(std::make_shared<MySqlUserRepository>(db_manager_)),
-    session_repository_(std::make_shared<RedisSessionRepository>(redis_manager_))
+      strand_(boost::asio::make_strand(io_context)),
+      acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
+      user_manager_(std::make_shared<UserManager>(io_context)),
+      redis_manager_(std::make_shared<RedisManager>(io_context)),
+      db_manager_(std::make_shared<DatabaseManager>()),
+      user_repository_(std::make_shared<MySqlUserRepository>(db_manager_)),
+      session_repository_(std::make_shared<RedisSessionRepository>(redis_manager_))
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_, *this));
@@ -1952,7 +2067,8 @@ int main()
 
         server->StartAccept();
 
-        co_spawn(io_context, server->CreateRoomAsync("Lobby", 100), detached);
+        // 클라이언트 로비(Room ID: 1) 고정 생성
+        co_spawn(io_context, server->CreateRoomWithIdAsync(1, "Lobby", 100), detached);
 
         std::cout << "[Server] Running on port 8080 (3 Asio Threads + 1 DB Thread)..." << std::endl;
 
@@ -1961,7 +2077,7 @@ int main()
         {
             threads.emplace_back([&io_context, i]() {
                 std::cout << "[Asio Worker " << i + 1 << "] Started. Thread ID: "
-                    << std::this_thread::get_id() << std::endl;
+                          << std::this_thread::get_id() << std::endl;
                 io_context.run();
             });
         }
