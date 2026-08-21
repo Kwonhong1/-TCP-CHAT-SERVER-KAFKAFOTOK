@@ -51,11 +51,11 @@ enum class RoomPermission : uint32_t
     HOST = CHAT | KICK_USER | BAN_USER | CHANGE_CONFIG | DELEGATE_HOST
 };
 
-RoomPermission operator|(RoomPermission a, RoomPermission b) {
+inline RoomPermission operator|(RoomPermission a, RoomPermission b) {
     return static_cast<RoomPermission>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-bool HasPermission(RoomPermission user_perm, RoomPermission required_perm) {
+inline bool HasPermission(RoomPermission user_perm, RoomPermission required_perm) {
     return (static_cast<uint32_t>(user_perm) & static_cast<uint32_t>(required_perm)) == static_cast<uint32_t>(required_perm);
 }
 
@@ -294,7 +294,7 @@ public:
     }
 
     bool Init(const std::string& host, const std::string& user,
-              const std::string& pass, const std::string& dbname, unsigned int port = 3306)
+        const std::string& pass, const std::string& dbname, unsigned int port = 3306)
     {
         conn_ = mysql_init(nullptr);
         if (!conn_)
@@ -304,7 +304,7 @@ public:
         }
 
         if (!mysql_real_connect(conn_, host.c_str(), user.c_str(), pass.c_str(),
-                                dbname.c_str(), port, nullptr, 0))
+            dbname.c_str(), port, nullptr, 0))
         {
             std::cerr << "[DB Error] Connection failed: " << mysql_error(conn_) << "\n";
             mysql_close(conn_);
@@ -365,7 +365,7 @@ class RedisManager : public std::enable_shared_from_this<RedisManager>
 public:
     explicit RedisManager(boost::asio::io_context& io_context)
         : strand_(boost::asio::make_strand(io_context)),
-          conn_(std::make_shared<boost::redis::connection>(strand_)) {}
+        conn_(std::make_shared<boost::redis::connection>(strand_)) {}
 
     boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
 
@@ -379,7 +379,7 @@ public:
         if (!password.empty()) cfg.password = password;
 
         co_spawn(strand_, [conn = conn_, cfg]() -> awaitable<void> {
-            co_await conn->async_run(cfg, boost::redis::logger{boost::redis::logger::level::disabled}, use_awaitable);
+            co_await conn->async_run(cfg, boost::redis::logger{ boost::redis::logger::level::disabled }, use_awaitable);
             co_return;
         }, detached);
 
@@ -473,7 +473,7 @@ public:
 private:
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
     std::shared_ptr<boost::redis::connection> conn_;
-    bool is_connected_{false};
+    bool is_connected_{ false };
 };
 
 //=====================
@@ -485,13 +485,13 @@ public:
     virtual ~IUserRepository() = default;
 
     struct AuthResult {
-        bool success{false};
+        bool success{ false };
         DBUserData user_data;
     };
 
     struct RegisterResult {
-        bool success{false};
-        uint32_t assigned_id{0};
+        bool success{ false };
+        uint32_t assigned_id{ 0 };
     };
 
     virtual awaitable<AuthResult> AuthenticateUserAsync(std::string username, std::string password) = 0;
@@ -511,7 +511,10 @@ public:
 
         co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
             [this, username, password, result_ptr, executor](auto handler) {
-                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                // handler를 shared_ptr로 포장하여 std::function의 Copy-Constructible 조건 충족
+                auto shared_handler = std::make_shared<decltype(handler)>(std::move(handler));
+
+                db_mgr_->PostTask([username, password, result_ptr, executor, shared_handler](MYSQL* conn) {
                     std::string query = "SELECT id, username, password_hash FROM users WHERE username = '" + username + "' LIMIT 1;";
                     if (mysql_query(conn, query.c_str()) == 0)
                     {
@@ -531,8 +534,8 @@ public:
                         }
                     }
 
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
+                    boost::asio::post(executor, [shared_handler]() mutable {
+                        (*shared_handler)(boost::system::error_code{});
                     });
                 });
             },
@@ -549,7 +552,10 @@ public:
 
         co_await boost::asio::async_initiate<decltype(use_awaitable), void(boost::system::error_code)>(
             [this, username, password, result_ptr, executor](auto handler) {
-                db_mgr_->PostTask([username, password, result_ptr, executor, handler = std::move(handler)](MYSQL* conn) mutable {
+                // handler를 shared_ptr로 포장하여 std::function의 Copy-Constructible 조건 충족
+                auto shared_handler = std::make_shared<decltype(handler)>(std::move(handler));
+
+                db_mgr_->PostTask([username, password, result_ptr, executor, shared_handler](MYSQL* conn) {
                     std::string query = "INSERT INTO users (username, password_hash) VALUES ('" + username + "', '" + password + "');";
                     if (mysql_query(conn, query.c_str()) == 0)
                     {
@@ -557,8 +563,8 @@ public:
                         result_ptr->assigned_id = static_cast<uint32_t>(mysql_insert_id(conn));
                     }
 
-                    boost::asio::post(executor, [handler = std::move(handler)]() mutable {
-                        handler(boost::system::error_code{});
+                    boost::asio::post(executor, [shared_handler]() mutable {
+                        (*shared_handler)(boost::system::error_code{});
                     });
                 });
             },
@@ -607,64 +613,6 @@ public:
 
 private:
     std::shared_ptr<RedisManager> redis_mgr_;
-};
-
-//=====================
-// 유저 클래스
-//=====================
-class User : public std::enable_shared_from_this<User>
-{
-public:
-    User(boost::asio::io_context& io_context, uint32_t id, const std::string& username)
-        : strand_(boost::asio::make_strand(io_context)),
-          id_(id), password_(0), username_(username), is_online_(false),
-          disconnect_timer_(strand_) {}
-
-    boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
-
-    void SetPassword(uint64_t password) { password_ = password; }
-    uint32_t GetId() const { return id_; }
-    uint64_t GetPassword() const { return password_; }
-    const std::string& GetUsername() const { return username_; }
-    bool IsOnline() const { return is_online_; }
-    void SetOnline(bool online) { is_online_ = online; }
-    void SetSession(std::shared_ptr<ChatSession> session) { session_ = session; }
-    std::weak_ptr<ChatSession> GetSession() const { return session_; }
-
-    void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
-    const std::string& GetReconnectToken() const { return reconnect_token_; }
-
-    template <typename OnExpiredCallback>
-    void StartDisconnectTimer(OnExpiredCallback&& on_expired)
-    {
-        co_spawn(strand_, [this, self = shared_from_this(), cb = std::forward<OnExpiredCallback>(on_expired)]() mutable -> awaitable<void> {
-            boost::system::error_code ec;
-            disconnect_timer_.expires_after(std::chrono::seconds(60));
-            co_await disconnect_timer_.async_wait(boost::asio::redirect_error(use_awaitable, ec));
-            if (!ec)
-            {
-                cb();
-            }
-        }, detached);
-    }
-
-    void CancelDisconnectTimer()
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this()]() {
-            boost::system::error_code ec;
-            disconnect_timer_.cancel(ec);
-        });
-    }
-
-private:
-    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
-    uint32_t id_;
-    uint64_t password_;
-    std::string username_;
-    bool is_online_;
-    std::weak_ptr<ChatSession> session_;
-    std::string reconnect_token_;
-    boost::asio::steady_timer disconnect_timer_;
 };
 
 //=====================
@@ -737,6 +685,221 @@ private:
     size_t head_;
     size_t tail_;
     size_t size_;
+};
+
+//=====================
+// 세션 클래스 (Lock-Free Strand 기반)
+//=====================
+using MessageChannel = boost::asio::experimental::channel<void(boost::system::error_code, std::vector<char>)>;
+
+class ChatSession : public std::enable_shared_from_this<ChatSession>
+{
+public:
+    ChatSession(tcp::socket socket, ChatServer& server)
+        : strand_(boost::asio::make_strand(socket.get_executor())),
+        socket_(std::move(socket)), server_(server), user_id_(0),
+        is_authenticated_(false), is_disconnected_(false),
+        write_channel_(strand_, 100), idle_timer_(strand_) {}
+
+    ~ChatSession()
+    {
+        boost::system::error_code ec;
+        idle_timer_.cancel(ec);
+        socket_.close(ec);
+    }
+
+    boost::asio::strand<boost::asio::any_io_executor>& GetStrand() { return strand_; }
+
+    void Start()
+    {
+        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
+            StartIdleTimer();
+            co_spawn(strand_, WriteLoop(), detached);
+
+            PacketHeader prompt_header{};
+            prompt_header.packet_size = sizeof(PacketHeader);
+            prompt_header.message_type = MessageType::LOGIN_PROMPT;
+            prompt_header.user_id = 0;
+            prompt_header.sequence_number = 0;
+
+            SendMessage(&prompt_header, sizeof(PacketHeader));
+
+            co_await ReadLoop();
+        }, detached);
+    }
+
+    void SendMessage(const void* data, size_t size)
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this(), msg_data = std::vector<char>(static_cast<const char*>(data), static_cast<const char*>(data) + size)]() mutable {
+            if (is_disconnected_) return;
+            write_channel_.try_send(boost::system::error_code{}, std::move(msg_data));
+        });
+    }
+
+    void SetUserId(uint32_t id) { user_id_ = id; }
+    uint32_t GetUserId() const { return user_id_; }
+    void SetAuthenticated(bool auth) { is_authenticated_ = auth; }
+    bool IsAuthenticated() const { return is_authenticated_; }
+    bool IsDisconnected() const { return is_disconnected_; }
+
+    void Disconnect();
+
+    void Kick()
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this()]() {
+            Disconnect();
+        });
+    }
+
+    void ResetTimer()
+    {
+        idle_timer_.expires_after(std::chrono::seconds(300));
+    }
+
+private:
+    void StartIdleTimer()
+    {
+        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
+            while (!is_disconnected_)
+            {
+                boost::system::error_code ec;
+                idle_timer_.expires_after(std::chrono::seconds(300));
+                co_await idle_timer_.async_wait(boost::asio::redirect_error(use_awaitable, ec));
+
+                if (!ec)
+                {
+                    std::cout << "[System] Session timed out due to inactivity. User ID: " << user_id_ << '\n';
+                    Disconnect();
+                    break;
+                }
+                else if (ec == boost::asio::error::operation_aborted)
+                {
+                    continue;
+                }
+                else
+                {
+                    break;
+                }
+            }
+        }, detached);
+    }
+
+    awaitable<void> ReadLoop()
+    {
+        try
+        {
+            while (!is_disconnected_)
+            {
+                size_t length = co_await socket_.async_read_some(boost::asio::buffer(read_buffer_), use_awaitable);
+                ResetTimer();
+                if (!packet_buffer_.WriteData(read_buffer_.data(), length))
+                {
+                    std::cerr << "[Error] Ring Buffer Overflow! Closing Session." << std::endl;
+                    Disconnect();
+                    co_return;
+                }
+
+                std::vector<char> packet_data;
+                while (packet_buffer_.ReadPacket(packet_data))
+                {
+                    co_await ProcessPacketAsync(packet_data.data(), packet_data.size());
+                }
+            }
+        }
+        catch (const boost::system::system_error&)
+        {
+            Disconnect();
+        }
+    }
+
+    awaitable<void> WriteLoop()
+    {
+        try
+        {
+            while (!is_disconnected_)
+            {
+                std::vector<char> msg = co_await write_channel_.async_receive(use_awaitable);
+                if (is_disconnected_) break;
+
+                co_await boost::asio::async_write(socket_, boost::asio::buffer(msg.data(), msg.size()), use_awaitable);
+            }
+        }
+        catch (const boost::system::system_error&)
+        {
+            Disconnect();
+        }
+    }
+
+    awaitable<void> ProcessPacketAsync(const char* data, size_t size);
+
+    boost::asio::strand<boost::asio::any_io_executor> strand_;
+    tcp::socket socket_;
+    ChatServer& server_;
+    uint32_t user_id_;
+    bool is_authenticated_;
+    bool is_disconnected_;
+    MessageChannel write_channel_;
+    boost::asio::steady_timer idle_timer_;
+    std::vector<char> read_buffer_ = std::vector<char>(4096);
+    RingPacketBuffer packet_buffer_;
+};
+
+//=====================
+// 유저 클래스
+//=====================
+class User : public std::enable_shared_from_this<User>
+{
+public:
+    User(boost::asio::io_context& io_context, uint32_t id, const std::string& username)
+        : strand_(boost::asio::make_strand(io_context)),
+        id_(id), password_(0), username_(username), is_online_(false),
+        disconnect_timer_(strand_) {}
+
+    boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
+
+    void SetPassword(uint64_t password) { password_ = password; }
+    uint32_t GetId() const { return id_; }
+    uint64_t GetPassword() const { return password_; }
+    const std::string& GetUsername() const { return username_; }
+    bool IsOnline() const { return is_online_; }
+    void SetOnline(bool online) { is_online_ = online; }
+    void SetSession(std::shared_ptr<ChatSession> session) { session_ = session; }
+    std::weak_ptr<ChatSession> GetSession() const { return session_; }
+
+    void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
+    const std::string& GetReconnectToken() const { return reconnect_token_; }
+
+    template <typename OnExpiredCallback>
+    void StartDisconnectTimer(OnExpiredCallback&& on_expired)
+    {
+        co_spawn(strand_, [this, self = shared_from_this(), cb = std::forward<OnExpiredCallback>(on_expired)]() mutable -> awaitable<void> {
+            boost::system::error_code ec;
+            disconnect_timer_.expires_after(std::chrono::seconds(60));
+            co_await disconnect_timer_.async_wait(boost::asio::redirect_error(use_awaitable, ec));
+            if (!ec)
+            {
+                cb();
+            }
+        }, detached);
+    }
+
+    void CancelDisconnectTimer()
+    {
+        boost::asio::post(strand_, [this, self = shared_from_this()]() {
+            boost::system::error_code ec;
+            disconnect_timer_.cancel(ec);
+        });
+    }
+
+private:
+    boost::asio::strand<boost::asio::io_context::executor_type> strand_;
+    uint32_t id_;
+    uint64_t password_;
+    std::string username_;
+    bool is_online_;
+    std::weak_ptr<ChatSession> session_;
+    std::string reconnect_token_;
+    boost::asio::steady_timer disconnect_timer_;
 };
 
 //=====================
@@ -956,164 +1119,7 @@ private:
 };
 
 //=====================
-// 세션 클래스 (Lock-Free Strand 기반)
-//=====================
-using MessageChannel = boost::asio::experimental::channel<void(boost::system::error_code, std::vector<char>)>;
-
-class ChatSession : public std::enable_shared_from_this<ChatSession>
-{
-public:
-    ChatSession(tcp::socket socket, ChatServer& server)
-        : strand_(boost::asio::make_strand(socket.get_executor())),
-          socket_(std::move(socket)), server_(server), user_id_(0),
-          is_authenticated_(false), is_disconnected_(false),
-          write_channel_(strand_, 100), idle_timer_(strand_) {}
-
-    ~ChatSession()
-    {
-        boost::system::error_code ec;
-        idle_timer_.cancel(ec);
-        socket_.close(ec);
-    }
-
-    boost::asio::strand<boost::asio::any_io_executor>& GetStrand() { return strand_; }
-
-    void Start()
-    {
-        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
-            StartIdleTimer();
-            co_spawn(strand_, WriteLoop(), detached);
-
-            PacketHeader prompt_header{};
-            prompt_header.packet_size = sizeof(PacketHeader);
-            prompt_header.message_type = MessageType::LOGIN_PROMPT;
-            prompt_header.user_id = 0;
-            prompt_header.sequence_number = 0;
-
-            SendMessage(&prompt_header, sizeof(PacketHeader));
-
-            co_await ReadLoop();
-        }, detached);
-    }
-
-    void SendMessage(const void* data, size_t size)
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this(), msg_data = std::vector<char>(static_cast<const char*>(data), static_cast<const char*>(data) + size)]() mutable {
-            if (is_disconnected_) return;
-            write_channel_.try_send(boost::system::error_code{}, std::move(msg_data));
-        });
-    }
-
-    void SetUserId(uint32_t id) { user_id_ = id; }
-    uint32_t GetUserId() const { return user_id_; }
-    void SetAuthenticated(bool auth) { is_authenticated_ = auth; }
-    bool IsAuthenticated() const { return is_authenticated_; }
-    bool IsDisconnected() const { return is_disconnected_; }
-
-    void Disconnect();
-
-    void Kick()
-    {
-        boost::asio::post(strand_, [this, self = shared_from_this()]() {
-            Disconnect();
-        });
-    }
-
-    void ResetTimer()
-    {
-        idle_timer_.expires_after(std::chrono::seconds(300));
-    }
-
-private:
-    void StartIdleTimer()
-    {
-        co_spawn(strand_, [this, self = shared_from_this()]() -> awaitable<void> {
-            while (!is_disconnected_)
-            {
-                boost::system::error_code ec;
-                idle_timer_.expires_after(std::chrono::seconds(300));
-                co_await idle_timer_.async_wait(boost::asio::redirect_error(use_awaitable, ec));
-
-                if (!ec)
-                {
-                    std::cout << "[System] Session timed out due to inactivity. User ID: " << user_id_ << '\n';
-                    Disconnect();
-                    break;
-                }
-                else if (ec == boost::asio::error::operation_aborted)
-                {
-                    continue;
-                }
-                else
-                {
-                    break;
-                }
-            }
-        }, detached);
-    }
-
-    awaitable<void> ReadLoop()
-    {
-        try
-        {
-            while (!is_disconnected_)
-            {
-                size_t length = co_await socket_.async_read_some(boost::asio::buffer(read_buffer_), use_awaitable);
-                ResetTimer();
-                if (!packet_buffer_.WriteData(read_buffer_.data(), length))
-                {
-                    std::cerr << "[Error] Ring Buffer Overflow! Closing Session." << std::endl;
-                    Disconnect();
-                    co_return;
-                }
-
-                std::vector<char> packet_data;
-                while (packet_buffer_.ReadPacket(packet_data))
-                {
-                    co_await ProcessPacketAsync(packet_data.data(), packet_data.size());
-                }
-            }
-        }
-        catch (const boost::system::system_error&)
-        {
-            Disconnect();
-        }
-    }
-
-    awaitable<void> WriteLoop()
-    {
-        try
-        {
-            while (!is_disconnected_)
-            {
-                std::vector<char> msg = co_await write_channel_.async_receive(use_awaitable);
-                if (is_disconnected_) break;
-
-                co_await boost::asio::async_write(socket_, boost::asio::buffer(msg.data(), msg.size()), use_awaitable);
-            }
-        }
-        catch (const boost::system::system_error&)
-        {
-            Disconnect();
-        }
-    }
-
-    awaitable<void> ProcessPacketAsync(const char* data, size_t size);
-
-    boost::asio::strand<boost::asio::any_io_executor> strand_;
-    tcp::socket socket_;
-    ChatServer& server_;
-    uint32_t user_id_;
-    bool is_authenticated_;
-    bool is_disconnected_;
-    MessageChannel write_channel_;
-    boost::asio::steady_timer idle_timer_;
-    std::vector<char> read_buffer_ = std::vector<char>(4096);
-    RingPacketBuffer packet_buffer_;
-};
-
-//=====================
-// ChatRoom 브로드캐스트 구현 (Lock-Free Strand로 세션 포스트)
+// ChatRoom 브로드캐스트 구현
 //=====================
 void ChatRoom::BroadcastMessage(const ChatMessage& msg, uint32_t sender_id)
 {
@@ -1767,13 +1773,13 @@ private:
 // ChatServer 생성자 구현
 ChatServer::ChatServer(boost::asio::io_context& io_context, short port)
     : io_context_(io_context),
-      strand_(boost::asio::make_strand(io_context)),
-      acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
-      user_manager_(std::make_shared<UserManager>(io_context)),
-      redis_manager_(std::make_shared<RedisManager>(io_context)),
-      db_manager_(std::make_shared<DatabaseManager>()),
-      user_repository_(std::make_shared<MySqlUserRepository>(db_manager_)),
-      session_repository_(std::make_shared<RedisSessionRepository>(redis_manager_))
+    strand_(boost::asio::make_strand(io_context)),
+    acceptor_(io_context, tcp::endpoint(tcp::v4(), port)),
+    user_manager_(std::make_shared<UserManager>(io_context)),
+    redis_manager_(std::make_shared<RedisManager>(io_context)),
+    db_manager_(std::make_shared<DatabaseManager>()),
+    user_repository_(std::make_shared<MySqlUserRepository>(db_manager_)),
+    session_repository_(std::make_shared<RedisSessionRepository>(redis_manager_))
 {
     dispatcher_.RegisterHandler(MessageType::LOGIN_REQUEST, std::make_unique<LoginHandler>(*user_manager_, *this));
     dispatcher_.RegisterHandler(MessageType::REGISTER_REQUEST, std::make_unique<RegisterHandler>(*user_manager_, *this));
@@ -1815,8 +1821,8 @@ int main()
         for (int i = 0; i < 3; ++i)
         {
             threads.emplace_back([&io_context, i]() {
-                std::cout << "[Asio Worker " << i + 1 << "] Started. Thread ID: " 
-                          << std::this_thread::get_id() << std::endl;
+                std::cout << "[Asio Worker " << i + 1 << "] Started. Thread ID: "
+                    << std::this_thread::get_id() << std::endl;
                 io_context.run();
             });
         }
