@@ -41,8 +41,15 @@ enum class MessageType : uint16_t
     WHISPER_REQUEST = 1018,
     WHISPER_RESPONSE = 1019,
     WHISPER_NOTIFICATION = 1020,
-    RECONNECT_REQUEST = 1021, // 추가
-    RECONNECT_RESPONSE = 1022  // 추가
+    RECONNECT_REQUEST = 1021,
+    RECONNECT_RESPONSE = 1022,
+
+    // 방장 시스템 확장 패킷
+    KICK_USER_REQUEST = 1023,
+    KICK_USER_RESPONSE = 1024,
+    TRANSFER_MASTER_REQUEST = 1025,
+    TRANSFER_MASTER_RESPONSE = 1026,
+    ROOM_MASTER_CHANGED_NOTIFICATION = 1027
 };
 
 enum class AuthStatus
@@ -74,7 +81,7 @@ struct LoginResponse
     PacketHeader header;
     bool success;
     uint32_t assigned_user_id;
-    char reconnect_token[64]; // 추가: 재접속 인증 토큰
+    char reconnect_token[64];
     char error_message[128];
 };
 
@@ -106,6 +113,7 @@ struct RoomInfo
     char room_name[32];
     uint32_t current_users;
     uint32_t max_users;
+    uint32_t owner_id; // [확장] 방장 유저 ID
 };
 
 struct CreateRoomRequest
@@ -146,6 +154,7 @@ struct JoinRoomResponse
     PacketHeader header;
     bool success;
     uint32_t room_id;
+    uint32_t owner_id; // [확장] 방장 ID 수신
     char error_message[128];
 };
 
@@ -184,7 +193,6 @@ struct WhisperNotification
     char message[512];
 };
 
-// 재접속 패킷
 struct ReconnectRequest
 {
     PacketHeader header;
@@ -198,7 +206,44 @@ struct ReconnectResponse
     PacketHeader header;
     bool success;
     uint32_t restored_room_id;
+    uint32_t owner_id; // [확장] 방 복구 시 방장 정보 수신
     char error_message[128];
+};
+
+// --- 방장 시스템 확장 구조체 ---
+struct KickUserRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t target_user_id;
+};
+
+struct KickUserResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
+
+struct TransferMasterRequest
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t target_user_id;
+};
+
+struct TransferMasterResponse
+{
+    PacketHeader header;
+    bool success;
+    char error_message[128];
+};
+
+struct RoomMasterChangedNotification
+{
+    PacketHeader header;
+    uint32_t room_id;
+    uint32_t new_owner_id;
 };
 #pragma pack(pop)
 
@@ -335,6 +380,11 @@ public:
     void SetLastRoomId(uint32_t room_id) { last_room_id_ = room_id; }
     uint32_t GetLastRoomId() const { return last_room_id_; }
 
+    // 방장 정보 관리 함수
+    void SetCurrentRoomOwnerId(uint32_t owner_id) { current_room_owner_id_ = owner_id; }
+    uint32_t GetCurrentRoomOwnerId() const { return current_room_owner_id_; }
+    bool IsRoomOwner() const { return user_id_ != 0 && user_id_ == current_room_owner_id_; }
+
     bool IsConnected() const { return is_connected_; }
     bool IsConnectFailed() const { return connect_failed_; }
 
@@ -349,7 +399,6 @@ private:
                     is_connected_ = true;
                     connect_failed_ = false;
 
-                    // 재접속 토큰이 존재할 경우 자동 복구 요청 시도
                     if (!reconnect_token_.empty() && user_id_ != 0)
                     {
                         SendReconnectRequest();
@@ -405,7 +454,6 @@ private:
                     boost::system::error_code close_ec;
                     socket_.close(close_ec);
 
-                    // 로그인 성공 이력이 있으면 3초 뒤 자동 재연결 시도
                     if (auth_status_ == AuthStatus::SUCCESS && !reconnect_token_.empty())
                     {
                         ScheduleReconnect();
@@ -473,6 +521,8 @@ private:
 
     std::string reconnect_token_;
     std::atomic<uint32_t> last_room_id_{0};
+    std::atomic<uint32_t> current_room_owner_id_{0}; // 현재 속한 방의 방장 ID
+
     boost::asio::steady_timer reconnect_timer_{io_context_};
 
     MessageDispatcher dispatcher_;
@@ -504,7 +554,7 @@ public:
         if (res.success)
         {
             client->SetUserId(res.assigned_user_id);
-            client->SetReconnectToken(res.reconnect_token); // 서버로부터 전달받은 재접속 토큰 저장
+            client->SetReconnectToken(res.reconnect_token);
             client->SetAuthStatus(AuthStatus::SUCCESS);
             std::cout << "\n[System] Login Success! User ID: " << res.assigned_user_id << std::endl;
         }
@@ -592,7 +642,8 @@ public:
         {
             const auto& r = res.rooms[i];
             std::cout << "ID: [" << r.room_id << "] " << r.room_name 
-                      << " (" << r.current_users << "/" << r.max_users << ")" << std::endl;
+                      << " (" << r.current_users << "/" << r.max_users << ")"
+                      << " [Host ID: " << r.owner_id << "]" << std::endl;
         }
         std::cout << "====================================" << std::endl;
     }
@@ -609,7 +660,12 @@ public:
         if (res.success)
         {
             client->SetLastRoomId(res.room_id);
+            client->SetCurrentRoomOwnerId(res.owner_id);
             std::cout << "\n[System] Successfully joined room ID: " << res.room_id << std::endl;
+            if (client->IsRoomOwner())
+            {
+                std::cout << "[System] You are the Room Leader of this room." << std::endl;
+            }
         }
         else
         {
@@ -629,6 +685,7 @@ public:
         if (res.success)
         {
             client->SetLastRoomId(0);
+            client->SetCurrentRoomOwnerId(0);
             std::cout << "\n[System] Successfully left room." << std::endl;
         }
         else
@@ -648,7 +705,7 @@ public:
 
         if (!res.success)
         {
-            std::cout << "\n[System] 귓속말 전송 실패: " << res.error_message << std::endl;
+            std::cout << "\n[System] Whisper failed: " << res.error_message << std::endl;
             std::cout << "Message: " << std::flush;
         }
     }
@@ -662,12 +719,11 @@ public:
         if (size < sizeof(WhisperNotification)) return;
         const auto& notif = *reinterpret_cast<const WhisperNotification*>(data);
 
-        std::cout << "\n[귓속말 - " << notif.sender_username << "]: " << notif.message << std::endl;
+        std::cout << "\n[Whisper from " << notif.sender_username << "]: " << notif.message << std::endl;
         std::cout << "Message: " << std::flush;
     }
 };
 
-// 재접속 응답 처리 핸들러
 class ReconnectResponseHandler : public IMessageHandler
 {
 public:
@@ -679,10 +735,15 @@ public:
         if (res.success)
         {
             client->SetLastRoomId(res.restored_room_id);
+            client->SetCurrentRoomOwnerId(res.owner_id);
             std::cout << "\n[System] Reconnection & session restoration successful!" << std::endl;
             if (res.restored_room_id != 0)
             {
                 std::cout << "[System] Restored to previous Room ID: " << res.restored_room_id << std::endl;
+                if (client->IsRoomOwner())
+                {
+                    std::cout << "[System] You are the Room Leader." << std::endl;
+                }
             }
             else
             {
@@ -695,6 +756,65 @@ public:
             std::cout << "\n[System] Reconnection failed: " << res.error_message << std::endl;
             client->SetAuthStatus(AuthStatus::FAILED);
         }
+    }
+};
+
+// --- 방장 시스템 전용 응답 및 알림 핸들러 ---
+class KickUserResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(KickUserResponse)) return;
+        const auto& res = *reinterpret_cast<const KickUserResponse*>(data);
+
+        if (res.success)
+        {
+            std::cout << "\n[System] User kicked successfully." << std::endl;
+        }
+        else
+        {
+            std::cout << "\n[System] Kick failed: " << res.error_message << std::endl;
+        }
+        std::cout << "Message: " << std::flush;
+    }
+};
+
+class TransferMasterResponseHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(TransferMasterResponse)) return;
+        const auto& res = *reinterpret_cast<const TransferMasterResponse*>(data);
+
+        if (res.success)
+        {
+            std::cout << "\n[System] Master privilege transferred successfully." << std::endl;
+        }
+        else
+        {
+            std::cout << "\n[System] Transfer failed: " << res.error_message << std::endl;
+        }
+        std::cout << "Message: " << std::flush;
+    }
+};
+
+class RoomMasterChangedNotificationHandler : public IMessageHandler
+{
+public:
+    void HandleMessage(std::shared_ptr<ChatClient> client, const char* data, size_t size) override
+    {
+        if (size < sizeof(RoomMasterChangedNotification)) return;
+        const auto& notif = *reinterpret_cast<const RoomMasterChangedNotification*>(data);
+
+        client->SetCurrentRoomOwnerId(notif.new_owner_id);
+        std::cout << "\n[System] Room Leader changed to User ID: " << notif.new_owner_id << std::endl;
+        if (client->IsRoomOwner())
+        {
+            std::cout << "[System] You are now the Room Leader! (/kick, /pass commands available)" << std::endl;
+        }
+        std::cout << "Message: " << std::flush;
     }
 };
 
@@ -718,8 +838,12 @@ ChatClient::ChatClient(boost::asio::io_context& io_context)
     dispatcher_.RegisterHandler(MessageType::WHISPER_RESPONSE, std::make_unique<WhisperResponseHandler>());
     dispatcher_.RegisterHandler(MessageType::WHISPER_NOTIFICATION, std::make_unique<WhisperNotificationHandler>());
 
-    // 재접속 핸들러 등록
     dispatcher_.RegisterHandler(MessageType::RECONNECT_RESPONSE, std::make_unique<ReconnectResponseHandler>());
+
+    // 방장 확장 핸들러 등록
+    dispatcher_.RegisterHandler(MessageType::KICK_USER_RESPONSE, std::make_unique<KickUserResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::TRANSFER_MASTER_RESPONSE, std::make_unique<TransferMasterResponseHandler>());
+    dispatcher_.RegisterHandler(MessageType::ROOM_MASTER_CHANGED_NOTIFICATION, std::make_unique<RoomMasterChangedNotificationHandler>());
 }
 
 // =========================================================
@@ -851,7 +975,6 @@ int main()
             std::cout << "Enter Room ID to join (e.g. 1 for Lobby): ";
             if (!(std::cin >> target_room_id)) target_room_id = 1;
 
-            // 1) JOIN_ROOM 패킷 전송
             JoinRoomRequest join_req{};
             join_req.header.packet_size = sizeof(JoinRoomRequest);
             join_req.header.message_type = MessageType::JOIN_ROOM;
@@ -863,10 +986,10 @@ int main()
             std::cout << "\n==========================================" << std::endl;
             std::cout << " Entered Room [" << target_room_id << "]" << std::endl;
             std::cout << " Whisper Usage: /w <Username> <Message>" << std::endl;
+            std::cout << " Host Commands: /kick <User_ID>, /pass <User_ID>" << std::endl;
             std::cout << " Type '/quit' or '/exit' to leave room." << std::endl;
             std::cout << "==========================================" << std::endl;
 
-            // cin 버퍼 개행 문자 제거
             std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
 
             std::string line;
@@ -875,7 +998,6 @@ int main()
                 std::cout << "Message: ";
                 if (!std::getline(std::cin, line)) break;
 
-                // '/quit' 또는 '/exit' 입력 시 방 퇴장
                 if (line == "/quit" || line == "/exit")
                 {
                     LeaveRoomRequest leave_req{};
@@ -886,13 +1008,76 @@ int main()
 
                     client->Send(&leave_req, sizeof(LeaveRoomRequest));
                     client->SetLastRoomId(0);
+                    client->SetCurrentRoomOwnerId(0);
                     std::cout << "[System] Left Room " << target_room_id << ", returning to Lobby menu..." << std::endl;
                     break;
                 }
 
                 if (line.empty()) continue;
 
-                // --- 귓속말 명령 처리 (/w 유저명 메시지 또는 /whisper 유저명 메시지) ---
+                // --- 강퇴 명령어 (/kick <target_user_id>) ---
+                if (line.rfind("/kick ", 0) == 0)
+                {
+                    if (!client->IsRoomOwner())
+                    {
+                        std::cout << "[System] Only the room leader can kick users." << std::endl;
+                        continue;
+                    }
+
+                    std::stringstream ss(line);
+                    std::string cmd;
+                    uint32_t target_user_id = 0;
+                    ss >> cmd >> target_user_id;
+
+                    if (target_user_id == 0)
+                    {
+                        std::cout << "[System] Usage: /kick <user_id>" << std::endl;
+                        continue;
+                    }
+
+                    KickUserRequest req{};
+                    req.header.packet_size = sizeof(KickUserRequest);
+                    req.header.message_type = MessageType::KICK_USER_REQUEST;
+                    req.header.user_id = client->GetUserId();
+                    req.room_id = target_room_id;
+                    req.target_user_id = target_user_id;
+
+                    client->Send(&req, sizeof(KickUserRequest));
+                    continue;
+                }
+
+                // --- 방장 위임 명령어 (/pass <target_user_id>) ---
+                if (line.rfind("/pass ", 0) == 0)
+                {
+                    if (!client->IsRoomOwner())
+                    {
+                        std::cout << "[System] Only the room leader can transfer leadership." << std::endl;
+                        continue;
+                    }
+
+                    std::stringstream ss(line);
+                    std::string cmd;
+                    uint32_t target_user_id = 0;
+                    ss >> cmd >> target_user_id;
+
+                    if (target_user_id == 0)
+                    {
+                        std::cout << "[System] Usage: /pass <user_id>" << std::endl;
+                        continue;
+                    }
+
+                    TransferMasterRequest req{};
+                    req.header.packet_size = sizeof(TransferMasterRequest);
+                    req.header.message_type = MessageType::TRANSFER_MASTER_REQUEST;
+                    req.header.user_id = client->GetUserId();
+                    req.room_id = target_room_id;
+                    req.target_user_id = target_user_id;
+
+                    client->Send(&req, sizeof(TransferMasterRequest));
+                    continue;
+                }
+
+                // --- 귓속말 명령 처리 (/w 유저명 메시지) ---
                 if (line.rfind("/w ", 0) == 0 || line.rfind("/whisper ", 0) == 0)
                 {
                     std::stringstream ss(line);
