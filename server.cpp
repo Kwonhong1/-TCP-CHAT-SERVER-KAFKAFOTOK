@@ -168,6 +168,7 @@ struct CreateRoomResponse
     PacketHeader header;
     bool success;
     uint32_t created_room_id;
+    uint32_t owner_id;
     char error_message[128];
 };
 
@@ -1044,7 +1045,8 @@ class ChatRoom : public std::enable_shared_from_this<ChatRoom>
 {
 public:
     ChatRoom(boost::asio::io_context& io_context, uint32_t room_id, std::string name, uint32_t max_users)
-        : strand_(boost::asio::make_strand(io_context)), room_id_(room_id), name_(name), max_users_(max_users) {}
+        : strand_(boost::asio::make_strand(io_context)),
+          room_id_(room_id), name_(std::move(name)), max_users_(max_users), owner_id_(0) {}
 
     boost::asio::strand<boost::asio::io_context::executor_type>& GetStrand() { return strand_; }
 
@@ -1059,8 +1061,7 @@ public:
 
         auto it = users_.find(user->GetId());
         if (it != users_.end()) {
-            // 이미 같은 방에 있는 사용자는 기존 권한을 유지한다.
-            // 특히 HOST가 일반 JOIN/RECONNECT 때문에 MEMBER로 강등되는 것을 방지한다.
+            // 이미 입장한 유저는 중복 추가하지 않는다.
             co_return std::make_pair(true, "");
         }
 
@@ -1070,6 +1071,11 @@ public:
 
         users_[user->GetId()] = user;
         user_permissions_[user->GetId()] = perm;
+
+        // 방장이 지정되지 않은 방에 HOST로 첫 입장하면 그 유저가 방장이다.
+        if (owner_id_ == 0 && HasPermission(perm, RoomPermission::DELEGATE_HOST)) {
+            owner_id_ = user->GetId();
+        }
 
         BroadcastNotification(user->GetUsername() + " joined the room.", user->GetId());
         co_return std::make_pair(true, "");
@@ -1099,6 +1105,7 @@ public:
             std::string next_master_name = next_master_it->second->GetUsername();
 
             user_permissions_[next_master_id] = RoomPermission::HOST;
+            owner_id_ = next_master_id;
 
             MasterChangedNotification notif{};
             notif.header.packet_size = sizeof(MasterChangedNotification);
@@ -1113,18 +1120,17 @@ public:
             BroadcastNotification(next_master_name + " is now the room host.");
         }
 
+        if (owner_id_ == user_id) {
+            owner_id_ = 0;
+        }
+
         co_return std::make_pair(true, "");
     }
 
     awaitable<uint32_t> GetOwnerIdAsync()
     {
         co_await boost::asio::post(strand_, use_awaitable);
-        for (const auto& [id, perm] : user_permissions_)
-        {
-            if (HasPermission(perm, RoomPermission::DELEGATE_HOST))
-                co_return id;
-        }
-        co_return 0;
+        co_return owner_id_;
     }
 
     awaitable<bool> CheckPermissionAsync(uint32_t user_id, RoomPermission required_perm)
@@ -1195,6 +1201,7 @@ public:
 
         user_permissions_[operator_id] = RoomPermission::MEMBER;
         user_permissions_[target_id] = RoomPermission::HOST;
+        owner_id_ = target_id;
 
         std::string new_master_name = target_it->second->GetUsername();
 
@@ -1224,6 +1231,7 @@ private:
     uint32_t max_users_;
     std::unordered_map<uint32_t, std::shared_ptr<User>> users_;
     std::unordered_map<uint32_t, RoomPermission> user_permissions_;
+    uint32_t owner_id_;
 };
 
 //=====================
@@ -1457,7 +1465,6 @@ awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)
 {
     if (size < sizeof(PacketHeader)) co_return;
     const auto& header = *reinterpret_cast<const PacketHeader*>(data);
-    if (header.packet_size != size || header.packet_size < sizeof(PacketHeader)) co_return;
     co_await server_.GetDispatcher().DispatchMessageAsync(shared_from_this(), header, data, size);
 }
 
@@ -1632,24 +1639,16 @@ public:
         auto room = co_await server_.GetRoomAsync(req.last_room_id);
         if (room && !session->IsDisconnected())
         {
-            // 기존 방에 이미 있으면 기존 권한(HOST 포함)을 유지한다.
             auto [joined, join_err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
-            res.success = joined;
+            res.success = true;
             res.restored_room_id = joined ? req.last_room_id : 1;
             res.owner_id = joined ? co_await room->GetOwnerIdAsync() : 0;
         }
         else
         {
-            auto lobby = co_await server_.GetRoomAsync(1);
-            bool joined_lobby = false;
-            if (lobby)
-            {
-                auto result = co_await lobby->AddUserAsync(user, RoomPermission::MEMBER);
-                joined_lobby = result.first;
-                if (joined_lobby) res.owner_id = co_await lobby->GetOwnerIdAsync();
-            }
-            res.success = joined_lobby;
-            res.restored_room_id = joined_lobby ? 1 : 0;
+            res.success = true;
+            res.restored_room_id = 1;
+            res.owner_id = 0;
         }
 
         session->SendMessage(&res, sizeof(ReconnectResponse));
@@ -1697,6 +1696,7 @@ public:
             if (joined)
             {
                 res.created_room_id = created_room_id;
+                res.owner_id = co_await room->GetOwnerIdAsync();
             }
             else
             {
@@ -1875,6 +1875,7 @@ public:
         res.header.user_id = session->GetUserId();
         res.header.sequence_number = req.header.sequence_number;
         res.room_id = req.room_id;
+        res.owner_id = 0;
 
         if (!room || !user)
         {
@@ -1895,13 +1896,9 @@ public:
         auto [success, err] = co_await room->AddUserAsync(user, RoomPermission::MEMBER);
         res.success = success;
         if (success)
-        {
             res.owner_id = co_await room->GetOwnerIdAsync();
-        }
         else
-        {
             std::strncpy(res.error_message, err.c_str(), sizeof(res.error_message) - 1);
-        }
 
         if (!session->IsDisconnected())
         {
