@@ -1,0 +1,51 @@
+version: '3.8'
+
+services:
+  # 프로메테우스
+  prometheus:
+    image: prom/prometheus
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml
+    restart: always
+
+  # 그라파나 (프로비저닝 Volume 추가)
+  grafana:
+    image: grafana/grafana
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    volumes:
+      # 1. 데이터 소스(Prometheus) 자동 연동 설정 파일 디렉터리
+      - ./grafana/provisioning/datasources:/etc/grafana/provisioning/datasources
+      # 2. 대시보드 로드 위치 지정 설정 파일 디렉터리
+      - ./grafana/provisioning/dashboards:/etc/grafana/provisioning/dashboards
+      # 3. 실제 대시보드 JSON 파일들이 들어갈 로컬 디렉터리
+      - ./grafana/dashboards:/var/lib/grafana/dashboards
+    restart: always
+
+  # Process Exporter
+  process-exporter:
+    image: ncabatoff/process-exporter:latest
+    container_name: process-exporter
+    privileged: true
+    pid: "host"
+    volumes:
+      - ./process_exporter.yml:/config/process_exporter.yml
+    command:
+      - "-config.path=/config/process_exporter.yml"
+    restart: always
+
+  # Node Exporter
+  node-exporter:
+    image: prom/node-exporter:latest
+    container_name: node-exporter
+    network_mode: "host"
+    pid: "host"
+    volumes:
+      - '/:/host:ro,rslave'
+    command:
+      - '--path.rootfs=/host'
+    restart: always
