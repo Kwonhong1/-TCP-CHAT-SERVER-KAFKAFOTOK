@@ -1,0 +1,4 @@
+process_names:
+  - name: "{{.Matches}}"
+    cmdline:
+      - 'cpp_server'   # <--- 본 인 의  C++ 채 팅  서 버  실 행  파 일 명 이 나  실 행  키 워 드 로  변 경
