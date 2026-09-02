@@ -6,7 +6,7 @@
         "builtIn": true,
         "enable": true,
         "hide": true,
-        "iconColor": "rgba(0, 211, 255, 1)",
+        "iconColor": "",
         "name": "Annotations & Alerts",
         "query": {
           "datasource": {
@@ -36,7 +36,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -69,6 +69,8 @@
                 "color": {
                   "mode": "thresholds"
                 },
+                "max": 1,
+                "min": 0,
                 "thresholds": {
                   "mode": "absolute",
                   "steps": [
@@ -136,7 +138,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -265,7 +267,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -298,6 +300,8 @@
                 "color": {
                   "mode": "thresholds"
                 },
+                "max": 1,
+                "min": 0,
                 "thresholds": {
                   "mode": "percentage",
                   "steps": [
@@ -365,7 +369,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -486,7 +490,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -611,7 +615,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -732,7 +736,7 @@
                   "hidden": false,
                   "query": {
                     "datasource": {
-                      "name": "dfwpx2gflt1xcc"
+                      "name": "PBFA97CFB590B2093"
                     },
                     "group": "prometheus",
                     "kind": "DataQuery",
@@ -940,18 +944,10 @@
   },
   "links": [],
   "liveNow": false,
-  "preferences": {
-    "layout": {
-      "kind": "GridLayout",
-      "spec": {
-        "items": []
-      }
-    }
-  },
   "preload": false,
   "tags": [],
   "timeSettings": {
-    "autoRefresh": "",
+    "autoRefresh": "5s",
     "autoRefreshIntervals": [
       "5s",
       "10s",
@@ -965,12 +961,12 @@
       "1d"
     ],
     "fiscalYearStartMonth": 0,
-    "from": "2026-08-30T06:51:40.240Z",
+    "from": "now-5m",
     "hideTimepicker": false,
     "timezone": "browser",
-    "to": "2026-08-30T07:11:40.240Z"
+    "to": "now"
   },
-  "title": "New dashboard Copy",
+  "title": "My Chat Server Dashboard",
   "variables": [
     {
       "kind": "QueryVariable",
@@ -983,7 +979,6 @@
         "definition": "label_values(node_network_transmit_bytes_total,$instance)",
         "hide": "dontHide",
         "includeAll": false,
-        "label": "",
         "multi": false,
         "name": "instance",
         "options": [],
@@ -994,7 +989,6 @@
           "group": "prometheus",
           "kind": "DataQuery",
           "spec": {
-            "qryType": 1,
             "query": "label_values(node_network_transmit_bytes_total,$instance)",
             "refId": "PrometheusVariableQueryEditor-VariableQuery"
           },
