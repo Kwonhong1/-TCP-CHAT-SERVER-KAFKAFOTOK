@@ -1,7 +1,6 @@
 # Binary & Executables
 # 빌드된 단독 실행 바이너리 및 테스팅 파일
 /chat_load_tester
-/clt
 *.exe
 *.exe*
 *.dll
