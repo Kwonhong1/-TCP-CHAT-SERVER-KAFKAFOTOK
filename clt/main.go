@@ -14,6 +14,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // ==========================================
@@ -25,16 +27,16 @@ const HeaderSize = 12 // uint16(2) + uint16(2) + uint32(4) + uint32(4)
 type MessageType uint16
 
 const (
-	LOGIN_PROMPT             MessageType = 1000
-	LOGIN_REQUEST            MessageType = 1001
-	LOGIN_RESPONSE           MessageType = 1002
-	CHAT_MESSAGE             MessageType = 1005
-	JOIN_ROOM                MessageType = 1006
-	REGISTER_REQUEST         MessageType = 1015
-	REGISTER_RESPONSE        MessageType = 1016
-	JOIN_ROOM_RESPONSE       MessageType = 1017
-	PING                     MessageType = 1029
-	PONG                     MessageType = 1030
+	LOGIN_PROMPT       MessageType = 1000
+	LOGIN_REQUEST      MessageType = 1001
+	LOGIN_RESPONSE     MessageType = 1002
+	CHAT_MESSAGE       MessageType = 1005
+	JOIN_ROOM          MessageType = 1006
+	REGISTER_REQUEST   MessageType = 1015
+	REGISTER_RESPONSE  MessageType = 1016
+	JOIN_ROOM_RESPONSE MessageType = 1017
+	PING               MessageType = 1029
+	PONG               MessageType = 1030
 )
 
 // C++ struct PacketHeader (Little Endian)
@@ -135,7 +137,7 @@ func (c *Client) SendPacket(msgType MessageType, pbMsg proto.Message) error {
 
 // 1) 회원가입 요청
 func (c *Client) Register(username, password string) error {
-	req := &pb.RegisterRequest{
+	req := &RegisterRequest{
 		Username: username,
 		Password: password,
 	}
@@ -144,7 +146,7 @@ func (c *Client) Register(username, password string) error {
 
 // 2) 로그인 요청
 func (c *Client) Login(username, password string) error {
-	req := &pb.LoginRequest{
+	req := &LoginRequest{
 		Username: username,
 		Password: password,
 	}
@@ -153,7 +155,7 @@ func (c *Client) Login(username, password string) error {
 
 // 3) 1번 방 입장 요청 (JOIN_ROOM = 1006)
 func (c *Client) EnterRoom(roomID uint32) error {
-	req := &pb.JoinRoomRequest{
+	req := &JoinRoomRequest{
 		RoomId: roomID,
 	}
 	return c.SendPacket(JOIN_ROOM, req)
@@ -161,10 +163,12 @@ func (c *Client) EnterRoom(roomID uint32) error {
 
 // 4) 채팅 메시지 전송 (CHAT_MESSAGE = 1005)
 func (c *Client) SendChatMessage(roomID uint32, message string) error {
-	req := &pb.ChatMessage{
-		RoomId:    roomID,
-		Message:   message,
-		Timestamp: time.Now().Unix(),
+	req := &ChatMessage{
+		RoomId:         roomID,
+		Message:        message,
+		SenderId:       c.userID,
+		SenderUsername: c.username,
+		Timestamp:      time.Now().Unix(),
 	}
 	return c.SendPacket(CHAT_MESSAGE, req)
 }
@@ -199,7 +203,7 @@ func (c *Client) ReadLoop() {
 
 		// 로그인 응답 처리 (Assigned User ID 수득)
 		if msgType == LOGIN_RESPONSE {
-			var res pb.LoginResponse
+			var res LoginResponse
 			if err := proto.Unmarshal(payload, &res); err == nil && res.GetSuccess() {
 				c.userID = res.GetAssignedUserId()
 			}
