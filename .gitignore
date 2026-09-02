@@ -1,0 +1,33 @@
+# Binary & Executables
+# 빌드된 단독 실행 바이너리 및 테스팅 파일
+/chat_load_tester
+*.exe
+*.exe*
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go Dependencies & Cache
+# go.work 환경 및 로컬 패키지 드롭용 (go.mod, go.sum은 저장소에 포함되어야 함)
+go.work
+go.work.sum
+
+# TLS/SSL Certificate Files
+# 로컬 개발 및 테스트용 보안 키 파일 실수 방지
+*.pem
+*.crt
+*.key
+
+# IDEs & Editors
+# VS Code, JetBrains 계열 설정 폴더
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS Generated Files
+# OS 임시 메타데이터 파일
+.DS_Store
+Thumbs.db
