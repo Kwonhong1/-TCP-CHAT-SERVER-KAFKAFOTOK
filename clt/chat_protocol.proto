@@ -1,5 +1,6 @@
 syntax = "proto3";
 package chat;
+option go_package = "./;main";
 // --- 공 통  데 이 터  구 조  ---
 message RoomInfo {
     uint32 room_id = 1;
