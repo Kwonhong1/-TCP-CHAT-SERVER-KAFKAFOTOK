@@ -16,8 +16,7 @@ import (
 	"time"
 
 	// 프로젝트의 Protobuf 패키지 경로
-	pb "github.com/Kwonhong1/-TCP-CHAT-SERVER-KAFKAFOTOK/clt/proto" 
-	"google.golang.org/protobuf/proto"
+	pb "clt"
 )
 
 // ==========================================
