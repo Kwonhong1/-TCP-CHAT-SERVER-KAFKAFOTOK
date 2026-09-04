@@ -1,0 +1,108 @@
+syntax = "proto3";
+
+package chatdb;
+
+option go_package = "./pb";
+
+// --- gRPC DB 서비스 정의 ---
+service ChatDBService {
+    rpc AuthenticateUser (AuthRequest) returns (AuthResponse);
+    rpc RegisterUser (RegisterRequest) returns (RegisterResponse);
+    rpc IssueToken (IssueTokenRequest) returns (IssueTokenResponse);
+    rpc VerifyToken (VerifyTokenRequest) returns (VerifyTokenResponse);
+    rpc SetSessionState (SessionStateRequest) returns (SessionStateResponse);
+    rpc PublishChat (ChatPublishRequest) returns (ChatPublishResponse);
+    rpc GetChatHistory (ChatHistoryRequest) returns (ChatHistoryResponse); // 추가: 채팅 기록 조회 RPC
+}
+
+// --- 유저 및 인증 관련 메시지 ---
+message AuthRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message AuthResponse {
+    bool success = 1;
+    uint32 user_id = 2;
+    string reconnect_token = 3; // 수정: 오타 수정 (reconnnect -> reconnect)
+    string error_message = 4;
+}
+
+message RegisterRequest {
+    string username = 1;
+    string password = 2;
+}
+
+message RegisterResponse {
+    bool success = 1;
+    uint32 assigned_id = 2;
+    string error_message = 3;
+}
+
+message IssueTokenRequest {
+    uint32 user_id = 1;
+    string username = 2;
+    int32 ttl_seconds = 3; // 수정: proto3 기본값 구문 제거 및 태그 번호 부여
+}
+
+message IssueTokenResponse {
+    bool success = 1;
+    string token = 2;
+    string error_message = 3;
+}
+
+message VerifyTokenRequest {
+    string token = 1;
+}
+
+message VerifyTokenResponse {
+    bool success = 1;
+    uint32 user_id = 2;
+    string username = 3;
+    string error_message = 4;
+}
+
+message SessionStateRequest {
+    uint32 user_id = 1;
+    string state = 2;
+    int32 ttl_seconds = 3;
+}
+
+message SessionStateResponse {
+    bool success = 1;
+}
+
+// --- 채팅 DB 관련 메시지 ---
+message ChatPublishRequest {
+    uint32 room_id = 1;
+    uint32 user_id = 2;
+    string message = 3;
+    int64 timestamp = 4; // 추가: C++ 서버 매핑용 타임스탬프
+}
+
+message ChatPublishResponse {
+    bool success = 1;
+}
+
+// 추가: C++ ChatRepository 매핑용 채팅 히스토리 구조체
+message ChatMessageData {
+    uint64 message_id = 1;
+    uint32 room_id = 2;
+    uint32 sender_id = 3;
+    string sender_name = 4;
+    string message = 5;
+    int64 timestamp = 6;
+}
+
+message ChatHistoryRequest {
+    uint32 room_id = 1;
+    uint64 last_message_id = 2;
+    uint32 limit = 3;
+}
+
+message ChatHistoryResponse {
+    bool success = 1;
+    repeated ChatMessageData messages = 2;
+    string error_message = 3;
+}
+

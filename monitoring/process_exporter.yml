@@ -1,0 +1,7 @@
+process_names:
+  - name: "cpp_chat_server"
+    cmdline:
+      - '.*server.*'
+    comm:
+      - 'server'
+

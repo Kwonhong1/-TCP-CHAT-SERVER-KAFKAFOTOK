@@ -1,0 +1,4 @@
+process_names:
+  - name: "{{.Matches}}"
+    cmdline:
+      - 'server'   # 본인의 C++ 서버 실행 파일명 (수정이 필요한 경우 바꿔주세요)

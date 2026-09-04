@@ -1,0 +1,3 @@
+# Hashes of file build rules.
+a1610596f1443761697ab5a9691dfb34 chat_db.pb.cc
+f887d45999924d2bb8dca2268e89e032 chat_protocol.pb.cc

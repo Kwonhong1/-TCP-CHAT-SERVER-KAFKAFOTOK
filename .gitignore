@@ -1,0 +1,13 @@
+.bash_history
+.bashrc
+.cache/
+.config/
+.docker/
+.lesshst
+.local/
+.ssh/
+.vim/
+.viminfo
+build/
+build_server/
+-TCP-CHAT-SERVER-KAFKAFOTOK/
