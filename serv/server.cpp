@@ -265,7 +265,7 @@ public:
         auto executor = co_await boost::asio::this_coro::executor;
 
         co_return co_await boost::asio::async_initiate<decltype(use_awaitable), void(AuthResult)>(
-            [this, username, password, executor](auto handler) mutable {
+            [executor, username, context, req, res, handler_ptr](auto handler) mutable {
                 auto context = std::make_shared<grpc::ClientContext>();
                 auto req = std::make_shared<chatdb::AuthRequest>();
                 req->set_username(username);
@@ -311,7 +311,7 @@ public:
                 auto handler_ptr = std::make_shared<decltype(handler)>(std::move(handler));
 
                 stub_->async()->RegisterUser(context.get(), req.get(), res.get(),
-                    [executor, res, handler_ptr](grpc::Status status) mutable {
+                    [executor, context, req, res, handler_ptr](grpc::Status status) mutable {
                         RegisterResult result;
                         if (status.ok() && res->success()) {
                             result.success = true;
@@ -344,7 +344,7 @@ public:
                 auto handler_ptr = std::make_shared<decltype(handler)>(std::move(handler));
 
                 stub_->async()->VerifyToken(context.get(), req.get(), res.get(),
-                    [executor, res, handler_ptr](grpc::Status status) mutable {
+                    [executor, context, req, res, handler_ptr](grpc::Status status) mutable {
                         VerifyTokenResult result;
                         if (status.ok() && res->success()) {
                             result.success = true;
@@ -390,7 +390,7 @@ public:
                 auto handler_ptr = std::make_shared<decltype(handler)>(std::move(handler));
 
                 stub_->async()->SetSessionState(context.get(), req.get(), res.get(),
-                    [executor, res, handler_ptr](grpc::Status status) mutable {
+                    [executor, context, req, res, handler_ptr](grpc::Status status) mutable {
                         bool success = status.ok() && res->success();
                         boost::asio::post(executor, [handler_ptr, success]() mutable {
                             (*handler_ptr)(success);
@@ -435,7 +435,7 @@ public:
                 auto handler_ptr = std::make_shared<decltype(handler)>(std::move(handler));
 
                 stub_->async()->PublishChat(context.get(), req.get(), res.get(),
-                    [executor, res, handler_ptr](grpc::Status status) mutable {
+                    [executor, context, req, res, handler_ptr](grpc::Status status) mutable {
                         bool success = status.ok() && res->success();
                         boost::asio::post(executor, [handler_ptr, success]() mutable {
                             (*handler_ptr)(success);
@@ -462,7 +462,7 @@ public:
                 auto handler_ptr = std::make_shared<decltype(handler)>(std::move(handler));
 
                 stub_->async()->GetChatHistory(context.get(), req.get(), res.get(),
-                    [executor, req, res, handler_ptr](grpc::Status status) mutable {
+                    [executor, context, req, res, handler_ptr](grpc::Status status) mutable {
                         ChatHistoryResult result;
                         if (status.ok() && res->success()) {
                             result.success = true;
