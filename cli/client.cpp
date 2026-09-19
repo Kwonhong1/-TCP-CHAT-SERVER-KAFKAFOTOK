@@ -1,5 +1,6 @@
 #include <boost/asio.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/endian/conversion.hpp>
 
 #include <iostream>
 #include <string>
@@ -11,17 +12,19 @@
 #include <cstring>
 #include <limits>
 #include <chrono>
+#include <future>
 
 #include "chat_protocol.pb.h"
 
 using boost::asio::ip::tcp;
 namespace ssl = boost::asio::ssl;
 
-constexpr size_t MAX_PACKET_SIZE = 4 * 1024; // 서버와 동일한 4KB 제한
+constexpr size_t MAX_PACKET_SIZE = 4 * 1024;
+constexpr std::size_t PACKET_HEADER_SIZE = 12;
 
-//=====================
-// 서버 코드와 1:1 완벽 일치하는 MessageType Enum
-//=====================
+//==================================================
+// MessageType
+//==================================================
 enum class MessageType : uint16_t
 {
     LOGIN_PROMPT = 1000,
@@ -51,263 +54,559 @@ enum class MessageType : uint16_t
     KICKED_NOTIFICATION = 1025,
     TRANSFER_MASTER_REQUEST = 1026,
     TRANSFER_MASTER_RESPONSE = 1027,
-    MASTER_CHANGED_NOTIFICATION = 1028
+    MASTER_CHANGED_NOTIFICATION = 1028,
+    PING = 1029,
+    PONG = 1030
 };
 
-#pragma pack(push, 1)
+//==================================================
+// Packet Header
+//==================================================
 struct PacketHeader
 {
-    uint16_t packet_size;
-    MessageType message_type;
-    uint32_t user_id;
-    uint32_t sequence_number;
+    uint16_t packet_size = 0;
+    MessageType message_type{};
+    uint32_t user_id = 0;
+    uint32_t sequence_number = 0;
 };
-#pragma pack(pop)
 
-class ChatClient : public std::enable_shared_from_this<ChatClient> {
+//==================================================
+// Packet Header Encoding
+//==================================================
+void EncodePacketHeader(const PacketHeader& header, char* dst)
+{
+    uint16_t packet_size = boost::endian::native_to_little(header.packet_size);
+    uint16_t message_type = boost::endian::native_to_little(static_cast<uint16_t>(header.message_type));
+    uint32_t user_id = boost::endian::native_to_little(header.user_id);
+    uint32_t sequence_number = boost::endian::native_to_little(header.sequence_number);
+
+    std::memcpy(dst + 0, &packet_size, sizeof(packet_size));
+    std::memcpy(dst + 2, &message_type, sizeof(message_type));
+    std::memcpy(dst + 4, &user_id, sizeof(user_id));
+    std::memcpy(dst + 8, &sequence_number, sizeof(sequence_number));
+}
+
+PacketHeader DecodePacketHeader(const char* src)
+{
+    uint16_t packet_size = 0;
+    uint16_t message_type = 0;
+    uint32_t user_id = 0;
+    uint32_t sequence_number = 0;
+
+    std::memcpy(&packet_size, src + 0, sizeof(packet_size));
+    std::memcpy(&message_type, src + 2, sizeof(message_type));
+    std::memcpy(&user_id, src + 4, sizeof(user_id));
+    std::memcpy(&sequence_number, src + 8, sizeof(sequence_number));
+
+    PacketHeader header{};
+    header.packet_size = boost::endian::little_to_native(packet_size);
+    header.message_type = static_cast<MessageType>(boost::endian::little_to_native(message_type));
+    header.user_id = boost::endian::little_to_native(user_id);
+    header.sequence_number = boost::endian::little_to_native(sequence_number);
+
+    return header;
+}
+
+//==================================================
+// ChatClient
+//==================================================
+class ChatClient : public std::enable_shared_from_this<ChatClient>
+{
 public:
     ChatClient(boost::asio::io_context& io_context, ssl::context& ssl_ctx)
         : io_context_(io_context), ssl_socket_(io_context, ssl_ctx) {}
 
-    void Start(const std::string& host, const std::string& port) {
+    std::future<bool> ConnectAsync(const std::string& host, const std::string& port)
+    {
+        auto promise = std::make_shared<std::promise<bool>>();
+        auto future = promise->get_future();
+
         tcp::resolver resolver(io_context_);
         auto endpoints = resolver.resolve(host, port);
 
-        boost::asio::async_connect(ssl_socket_.lowest_layer(), endpoints,
-            [this, self = shared_from_this()](boost::system::error_code ec, tcp::endpoint) {
+        boost::asio::async_connect(
+            ssl_socket_.lowest_layer(),
+            endpoints,
+            [this, self = shared_from_this(), promise](boost::system::error_code ec, tcp::endpoint)
+            {
                 if (!ec) {
-                    DoHandshake();
+                    DoHandshake(promise);
                 } else {
-                    is_connect_failed_ = true;
-                    std::cerr << "[네트워크] 서버 연결 실패: " << ec.message() << std::endl;
+                    is_connected_ = false;
+                    std::cerr << "[네트워크] 서버 연결 실패: " << ec.message() << '\n';
+                    promise->set_value(false);
+                }
+            });
+
+        return future;
+    }
+
+    template <typename T>
+    void SendProtoMessage(MessageType msg_type, const T& proto_msg)
+    {
+        std::string payload;
+
+        if (!proto_msg.SerializeToString(&payload)) {
+            std::cerr << "[직렬화] Protobuf 직렬화 실패\n";
+            return;
+        }
+
+        const size_t total_size = PACKET_HEADER_SIZE + payload.size();
+
+        if (total_size > MAX_PACKET_SIZE || total_size > std::numeric_limits<uint16_t>::max()) {
+            std::cerr << "[보안] 전송 패킷 크기 초과: " << total_size << '\n';
+            return;
+        }
+
+        PacketHeader header{};
+        header.packet_size = static_cast<uint16_t>(total_size);
+        header.message_type = msg_type;
+        header.user_id = user_id_.load();
+        header.sequence_number = 0;
+
+        std::vector<char> packet(total_size);
+        EncodePacketHeader(header, packet.data());
+
+        if (!payload.empty()) {
+            std::memcpy(packet.data() + PACKET_HEADER_SIZE, payload.data(), payload.size());
+        }
+
+        boost::asio::post(
+            io_context_,
+            [this, self = shared_from_this(), packet = std::move(packet)]() mutable
+            {
+                bool write_in_progress = !write_queue_.empty();
+                write_queue_.push(std::move(packet));
+
+                if (is_connected_ && !write_in_progress) {
+                    DoWrite();
                 }
             });
     }
 
-    template <typename T>
-    void SendProtoMessage(MessageType msg_type, const T& proto_msg) {
-        std::string payload;
-        proto_msg.SerializeToString(&payload);
-
+    void SendRawMessage(MessageType msg_type)
+    {
         PacketHeader header{};
-        header.packet_size = static_cast<uint16_t>(sizeof(PacketHeader) + payload.size());
+        header.packet_size = static_cast<uint16_t>(PACKET_HEADER_SIZE);
         header.message_type = msg_type;
-        header.user_id = user_id_;
+        header.user_id = user_id_.load();
         header.sequence_number = 0;
 
-        auto buf = std::make_shared<std::vector<char>>(header.packet_size);
-        std::memcpy(buf->data(), &header, sizeof(PacketHeader));
-        if (!payload.empty()) {
-            std::memcpy(buf->data() + sizeof(PacketHeader), payload.data(), payload.size());
-        }
+        std::vector<char> packet(PACKET_HEADER_SIZE);
+        EncodePacketHeader(header, packet.data());
 
-        boost::asio::post(io_context_, [this, self = shared_from_this(), buf]() {
-            bool write_in_progress = !write_queue_.empty();
-            write_queue_.push(*buf);
-            if (is_connected_ && !write_in_progress) {
-                DoWrite();
+        boost::asio::post(
+            io_context_,
+            [this, self = shared_from_this(), packet = std::move(packet)]() mutable
+            {
+                bool write_in_progress = !write_queue_.empty();
+                write_queue_.push(std::move(packet));
+
+                if (is_connected_ && !write_in_progress) {
+                    DoWrite();
+                }
+            });
+    }
+
+    void StartHeartbeatTimer()
+    {
+        if (!is_connected_) return;
+
+        ping_timer_.expires_after(std::chrono::seconds(15));
+        ping_timer_.async_wait(
+            [this, self = shared_from_this()](boost::system::error_code ec)
+            {
+                if (!ec && is_connected_) {
+                    SendRawMessage(MessageType::PING);
+                    StartHeartbeatTimer();
+                }
+            });
+    }
+
+    //==================================================
+    // Promise 등록
+    //==================================================
+    void RegisterAuthPromise(std::shared_ptr<std::promise<bool>> promise)
+    {
+        boost::asio::post(io_context_, [this, promise]()
+        {
+            if (auth_promise_) {
+                try { auth_promise_->set_value(false); } catch (...) {}
             }
+            auth_promise_ = promise;
         });
     }
 
-    bool IsConnected() const { return is_connected_; }
-    bool IsConnectFailed() const { return is_connect_failed_; }
-    
-    void SetUserId(uint32_t id) { user_id_ = id; }
-    uint32_t GetUserId() const { return user_id_; }
+    void RegisterRoomPromise(std::shared_ptr<std::promise<uint32_t>> promise)
+    {
+        boost::asio::post(io_context_, [this, promise]()
+        {
+            if (room_promise_) {
+                try { room_promise_->set_value(0); } catch (...) {}
+            }
+            room_promise_ = promise;
+        });
+    }
 
-    void SetReconnectToken(const std::string& token) { reconnect_token_ = token; }
-    std::string GetReconnectToken() const { return reconnect_token_; }
+    void RegisterLeavePromise(std::shared_ptr<std::promise<bool>> promise)
+    {
+        boost::asio::post(io_context_, [this, promise]()
+        {
+            if (leave_promise_) {
+                try { leave_promise_->set_value(false); } catch (...) {}
+            }
+            leave_promise_ = promise;
+        });
+    }
+
+    //==================================================
+    // 상태
+    //==================================================
+    bool IsConnected() const { return is_connected_.load(); }
+
+    void SetUserId(uint32_t id) { user_id_ = id; }
+    uint32_t GetUserId() const { return user_id_.load(); }
 
     void SetLastRoomId(uint32_t room_id) { last_room_id_ = room_id; }
-    uint32_t GetLastRoomId() const { return last_room_id_; }
+    uint32_t GetLastRoomId() const { return last_room_id_.load(); }
 
     void SetCurrentRoomOwnerId(uint32_t owner_id) { current_room_owner_id_ = owner_id; }
-    bool IsRoomOwner() const { return user_id_ != 0 && user_id_ == current_room_owner_id_; }
 
-    void SetRoomCreatedFlag(bool flag) { room_created_flag_ = flag; }
-    bool GetRoomCreatedFlag() const { return room_created_flag_; }
+    bool IsRoomOwner() const
+    {
+        return user_id_.load() != 0 && user_id_.load() == current_room_owner_id_.load();
+    }
 
-    void SetAuthResponseReceived(bool flag) { auth_response_received_ = flag; }
-    bool GetAuthResponseReceived() const { return auth_response_received_; }
+    //==================================================
+    // Close
+    //==================================================
+    void Close()
+    {
+        boost::asio::post(io_context_, [this, self = shared_from_this()]()
+        {
+            boost::system::error_code ec;
 
-    void Close() {
-        boost::asio::post(io_context_, [this, self = shared_from_this()]() {
+            ping_timer_.cancel(ec);
+
             if (ssl_socket_.lowest_layer().is_open()) {
-                boost::system::error_code ec;
                 ssl_socket_.lowest_layer().close(ec);
             }
+
             is_connected_ = false;
+
+            if (auth_promise_) {
+                try { auth_promise_->set_value(false); } catch (...) {}
+                auth_promise_.reset();
+            }
+
+            if (room_promise_) {
+                try { room_promise_->set_value(0); } catch (...) {}
+                room_promise_.reset();
+            }
+
+            if (leave_promise_) {
+                try { leave_promise_->set_value(false); } catch (...) {}
+                leave_promise_.reset();
+            }
         });
     }
 
 private:
-    void DoHandshake() {
-        ssl_socket_.async_handshake(ssl::stream_base::client,
-            [this, self = shared_from_this()](boost::system::error_code ec) {
+    //==================================================
+    // TLS
+    //==================================================
+    void DoHandshake(std::shared_ptr<std::promise<bool>> promise)
+    {
+        ssl_socket_.async_handshake(
+            ssl::stream_base::client,
+            [this, self = shared_from_this(), promise](boost::system::error_code ec)
+            {
                 if (!ec) {
                     is_connected_ = true;
                     std::cout << "[네트워크] SSL/TLS 암호화 연결 성공!\n";
+
+                    StartHeartbeatTimer();
                     DoReadHeader();
+                    promise->set_value(true);
                 } else {
-                    is_connect_failed_ = true;
-                    std::cerr << "[네트워크] SSL 핸드셰이크 실패: " << ec.message() << std::endl;
+                    is_connected_ = false;
+                    std::cerr << "[네트워크] SSL 핸드셰이크 실패: " << ec.message() << '\n';
+                    promise->set_value(false);
                 }
             });
     }
 
-    void DoReadHeader() {
-        header_buffer_.resize(sizeof(PacketHeader));
-        boost::asio::async_read(ssl_socket_, boost::asio::buffer(header_buffer_),
-            [this, self = shared_from_this()](boost::system::error_code ec, std::size_t) {
-                if (!ec) {
-                    PacketHeader header;
-                    std::memcpy(&header, header_buffer_.data(), sizeof(PacketHeader));
+    //==================================================
+    // Read
+    //==================================================
+    void DoReadHeader()
+    {
+        header_buffer_.resize(PACKET_HEADER_SIZE);
 
-                    if (header.packet_size < sizeof(PacketHeader) || header.packet_size > MAX_PACKET_SIZE) {
-                        std::cerr << "[보안] 비정상적인 패킷 크기 수신: " << header.packet_size << std::endl;
-                        Close();
-                        return;
-                    }
-
-                    uint16_t payload_size = header.packet_size - sizeof(PacketHeader);
-                    if (payload_size > 0) {
-                        DoReadPayload(header, payload_size);
-                    } else {
-                        ProcessPacket(header, nullptr, 0);
-                        DoReadHeader();
-                    }
-                } else {
-                    std::cerr << "\n[네트워크] 서버와의 연결이 종료되었습니다." << std::endl;
+        boost::asio::async_read(
+            ssl_socket_,
+            boost::asio::buffer(header_buffer_),
+            [this, self = shared_from_this()](boost::system::error_code ec, std::size_t)
+            {
+                if (ec) {
+                    std::cerr << "\n[네트워크] 서버와의 연결이 종료되었습니다.\n";
                     Close();
+                    return;
+                }
+
+                PacketHeader header = DecodePacketHeader(header_buffer_.data());
+
+                if (header.packet_size < PACKET_HEADER_SIZE || header.packet_size > MAX_PACKET_SIZE) {
+                    std::cerr << "[보안] 비정상 패킷 수신: " << header.packet_size << '\n';
+                    Close();
+                    return;
+                }
+
+                size_t payload_size = header.packet_size - PACKET_HEADER_SIZE;
+
+                if (payload_size > 0) {
+                    DoReadPayload(header, payload_size);
+                } else {
+                    ProcessPacket(header, nullptr, 0);
+                    DoReadHeader();
                 }
             });
     }
 
-    void DoReadPayload(PacketHeader header, uint16_t payload_size) {
+    void DoReadPayload(PacketHeader header, size_t payload_size)
+    {
         payload_buffer_.resize(payload_size);
-        boost::asio::async_read(ssl_socket_, boost::asio::buffer(payload_buffer_),
-            [this, self = shared_from_this(), header](boost::system::error_code ec, std::size_t) {
-                if (!ec) {
-                    ProcessPacket(header, payload_buffer_.data(), payload_buffer_.size());
-                    DoReadHeader();
-                } else {
+
+        boost::asio::async_read(
+            ssl_socket_,
+            boost::asio::buffer(payload_buffer_),
+            [this, self = shared_from_this(), header](boost::system::error_code ec, std::size_t)
+            {
+                if (ec) {
                     Close();
+                    return;
                 }
+
+                ProcessPacket(header, payload_buffer_.data(), payload_buffer_.size());
+                DoReadHeader();
             });
     }
 
-    void ProcessPacket(const PacketHeader& header, const char* payload, size_t payload_size) {
-        switch (header.message_type) {
+    //==================================================
+    // Packet 처리
+    //==================================================
+    void ProcessPacket(const PacketHeader& header, const char* payload, size_t payload_size)
+    {
+        switch (header.message_type)
+        {
+        case MessageType::PONG:
+            break;
+
         case MessageType::LOGIN_PROMPT:
             std::cout << "[시스템] 서버 연결 확인. 인증 진행이 가능합니다.\n";
             break;
 
         case MessageType::LOGIN_RESPONSE: {
             chat::LoginResponse res;
+            bool success = false;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
                     SetUserId(res.assigned_user_id());
-                    SetReconnectToken(res.reconnect_token());
                     std::cout << "\n[시스템] 로그인 성공! (유저 ID: " << res.assigned_user_id() << ")\n";
+                    success = true;
                 } else {
-                    std::cout << "\n[시스템] 로그인 실패: " << res.error_message() << "\n";
+                    std::cout << "\n[시스템] 로그인 실패: " << res.error_message() << '\n';
                 }
             }
-            SetAuthResponseReceived(true);
+
+            if (auth_promise_) {
+                try { auth_promise_->set_value(success); } catch (...) {}
+                auth_promise_.reset();
+            }
             break;
         }
 
         case MessageType::REGISTER_RESPONSE: {
             chat::RegisterResponse res;
+            bool success = false;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
-                    std::cout << "\n[시스템] 회원가입 완료! (할당 유저 ID: " << res.assigned_user_id() << ")\n";
+                    std::cout << "\n[시스템] 회원가입 완료! (유저 ID: " << res.assigned_user_id() << ")\n";
+                    success = true;
                 } else {
-                    std::cout << "\n[시스템] 회원가입 실패: " << res.error_message() << "\n";
+                    std::cout << "\n[시스템] 회원가입 실패: " << res.error_message() << '\n';
                 }
             }
-            SetAuthResponseReceived(true);
+
+            if (auth_promise_) {
+                try { auth_promise_->set_value(success); } catch (...) {}
+                auth_promise_.reset();
+            }
             break;
         }
 
         case MessageType::CREATE_ROOM_RESPONSE: {
             chat::CreateRoomResponse res;
+            uint32_t room_id = 0;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
-                    SetLastRoomId(res.created_room_id());
+                    room_id = res.created_room_id();
+                    SetLastRoomId(room_id);
                     SetCurrentRoomOwnerId(res.owner_id());
-                    SetRoomCreatedFlag(true);
-                    std::cout << "\n[시스템] 방 생성 성공! (방 번호: " << res.created_room_id() << ")\n";
+
+                    std::cout << "\n[시스템] 방 생성 성공! (방 번호: " << room_id << ")\n";
                 } else {
-                    SetRoomCreatedFlag(false);
-                    std::cout << "\n[시스템] 방 생성 실패: " << res.error_message() << "\n";
+                    std::cout << "\n[시스템] 방 생성 실패: " << res.error_message() << '\n';
                 }
             }
-            break;
-        }
 
-        case MessageType::ROOM_LIST_RESPONSE: {
-            chat::RoomListResponse res;
-            if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
-                std::cout << "\n================ [현재 개설된 방 목록] ================\n";
-                for (const auto& room : res.rooms()) {
-                    std::cout << "방 ID: " << room.room_id()
-                        << " | 제목: " << room.room_name()
-                        << " | 인원: (" << room.current_users() << "/" << room.max_users() << ")"
-                        << " | 방장 ID: " << room.owner_id() << "\n";
-                }
-                std::cout << "=======================================================\n";
+            if (room_promise_) {
+                try { room_promise_->set_value(room_id); } catch (...) {}
+                room_promise_.reset();
             }
             break;
         }
 
         case MessageType::JOIN_ROOM_RESPONSE: {
             chat::JoinRoomResponse res;
+            uint32_t room_id = 0;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
-                    SetLastRoomId(res.room_id());
+                    room_id = res.room_id();
+                    SetLastRoomId(room_id);
                     SetCurrentRoomOwnerId(res.owner_id());
-                    std::cout << "\n[시스템] #" << res.room_id() << "번 방 입장에 성공했습니다.\n";
+
+                    std::cout << "\n[시스템] #" << room_id << "번 방 입장에 성공했습니다.\n";
+
+                    if (res.recent_messages_size() > 0) {
+                        std::cout << "\n========== [최근 대화] ==========\n";
+
+                        for (const auto& msg : res.recent_messages()) {
+                            std::string sender = msg.sender_username().empty()
+                                ? std::to_string(msg.sender_id())
+                                : msg.sender_username();
+
+                            std::cout << "[" << sender << "]: " << msg.message() << '\n';
+                        }
+
+                        std::cout << "=================================\n";
+                    }
                 } else {
-                    std::cout << "\n[시스템] 방 입장 실패: " << res.error_message() << "\n";
+                    std::cout << "\n[시스템] 방 입장 실패: " << res.error_message() << '\n';
                 }
+            }
+
+            if (room_promise_) {
+                try { room_promise_->set_value(room_id); } catch (...) {}
+                room_promise_.reset();
             }
             break;
         }
 
+        case MessageType::ROOM_LIST_RESPONSE: {
+            chat::RoomListResponse res;
+
+            if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
+                std::cout << "\n================ [현재 개설된 방 목록] ================\n";
+
+                if (res.rooms_size() == 0) {
+                    std::cout << "현재 생성된 방이 없습니다.\n";
+                } else {
+                    for (const auto& room : res.rooms()) {
+                        std::cout << "방 ID: " << room.room_id()
+                                  << " | 제목: " << room.room_name()
+                                  << " | 인원: (" << room.current_users() << "/" << room.max_users() << ")"
+                                  << " | 방장 ID: " << room.owner_id() << '\n';
+                    }
+                }
+
+                std::cout << "=======================================================\n";
+            }
+            break;
+        }
+
+        // 서버 응답이 성공한 경우에만 로컬 방 상태를 제거한다.
         case MessageType::LEAVE_ROOM_RESPONSE: {
             chat::LeaveRoomResponse res;
+            bool success = false;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
                     SetLastRoomId(0);
                     SetCurrentRoomOwnerId(0);
                     std::cout << "\n[시스템] 정상적으로 퇴장했습니다.\n";
+                    success = true;
+                } else {
+                    std::cout << "\n[시스템] 방 퇴장 실패: " << res.error_message() << '\n';
                 }
+            } else {
+                std::cerr << "\n[시스템] 방 퇴장 응답 파싱에 실패했습니다.\n";
+            }
+
+            if (leave_promise_) {
+                try { leave_promise_->set_value(success); } catch (...) {}
+                leave_promise_.reset();
             }
             break;
         }
 
         case MessageType::CHAT_MESSAGE: {
             chat::ChatMessage msg;
+
             if (msg.ParseFromArray(payload, static_cast<int>(payload_size))) {
-                std::string sender = msg.sender_username().empty() ? std::to_string(msg.sender_id()) : msg.sender_username();
-                std::cout << "\n[" << sender << "]: " << msg.message() << std::endl;
+                std::string sender = msg.sender_username().empty()
+                    ? std::to_string(msg.sender_id())
+                    : msg.sender_username();
+
+                std::cout << "\n[" << sender << "]: " << msg.message() << '\n';
             }
             break;
         }
 
         case MessageType::CHAT_HISTORY_RESPONSE: {
             chat::ChatHistoryResponse res;
+
             if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 if (res.success()) {
                     std::cout << "\n================ [이전 대화 기록] ================\n";
+
                     for (const auto& msg : res.messages()) {
-                        std::cout << "[" << msg.sender_username() << "]: " << msg.message() << "\n";
+                        std::string sender = msg.sender_username().empty()
+                            ? std::to_string(msg.sender_id())
+                            : msg.sender_username();
+
+                        std::cout << "[" << sender << "]: " << msg.message() << '\n';
                     }
+
                     std::cout << "==================================================\n";
                 } else {
-                    std::cout << "\n[시스템] 기록 불러오기 실패: " << res.error_message() << "\n";
+                    std::cout << "\n[시스템] 기록 불러오기 실패: " << res.error_message() << '\n';
+                }
+            }
+            break;
+        }
+
+        case MessageType::SERVER_NOTIFICATION: {
+            chat::ServerNotification noti;
+
+            if (noti.ParseFromArray(payload, static_cast<int>(payload_size))) {
+                std::cout << "\n[서버] " << noti.message() << '\n';
+            }
+            break;
+        }
+
+        case MessageType::WHISPER_RESPONSE: {
+            chat::WhisperResponse res;
+
+            if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
+                if (res.success()) {
+                    std::cout << "\n[시스템] 귓속말을 전송했습니다.\n";
+                } else {
+                    std::cout << "\n[시스템] 귓속말 전송 실패: " << res.error_message() << '\n';
                 }
             }
             break;
@@ -315,27 +614,57 @@ private:
 
         case MessageType::WHISPER_NOTIFICATION: {
             chat::WhisperNotification noti;
+
             if (noti.ParseFromArray(payload, static_cast<int>(payload_size))) {
-                std::cout << "\n[귓속말 - " << noti.sender_username() << "]: " << noti.message() << std::endl;
+                std::cout << "\n[귓속말 - " << noti.sender_username() << "]: " << noti.message() << '\n';
+            }
+            break;
+        }
+
+        case MessageType::KICK_USER_RESPONSE: {
+            chat::KickUserResponse res;
+
+            if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
+                if (res.success()) {
+                    std::cout << "\n[시스템] 해당 사용자를 강퇴했습니다.\n";
+                } else {
+                    std::cout << "\n[시스템] 강퇴 실패: " << res.error_message() << '\n';
+                }
             }
             break;
         }
 
         case MessageType::KICKED_NOTIFICATION: {
             chat::KickedNotification noti;
+
             if (noti.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 SetLastRoomId(0);
                 SetCurrentRoomOwnerId(0);
-                std::cout << "\n[알림] 방에서 강퇴당했습니다. 사유: " << noti.reason() << std::endl;
+                std::cout << "\n[알림] 방에서 강퇴당했습니다. 사유: " << noti.reason() << '\n';
+            }
+            break;
+        }
+
+        case MessageType::TRANSFER_MASTER_RESPONSE: {
+            chat::TransferMasterResponse res;
+
+            if (res.ParseFromArray(payload, static_cast<int>(payload_size))) {
+                if (res.success()) {
+                    std::cout << "\n[시스템] 방장 권한을 위임했습니다.\n";
+                } else {
+                    std::cout << "\n[시스템] 방장 위임 실패: " << res.error_message() << '\n';
+                }
             }
             break;
         }
 
         case MessageType::MASTER_CHANGED_NOTIFICATION: {
             chat::MasterChangedNotification noti;
+
             if (noti.ParseFromArray(payload, static_cast<int>(payload_size))) {
                 SetCurrentRoomOwnerId(noti.new_master_id());
-                std::cout << "\n[알림] 방장이 변경되었습니다! (새 방장 유저 ID: " << noti.new_master_id() << ")" << std::endl;
+                std::cout << "\n[알림] 방장이 변경되었습니다! (새 방장 유저 ID: "
+                          << noti.new_master_id() << ")\n";
             }
             break;
         }
@@ -345,11 +674,19 @@ private:
         }
     }
 
-    void DoWrite() {
-        boost::asio::async_write(ssl_socket_, boost::asio::buffer(write_queue_.front()),
-            [this, self = shared_from_this()](boost::system::error_code ec, std::size_t) {
+    //==================================================
+    // Write
+    //==================================================
+    void DoWrite()
+    {
+        boost::asio::async_write(
+            ssl_socket_,
+            boost::asio::buffer(write_queue_.front()),
+            [this, self = shared_from_this()](boost::system::error_code ec, std::size_t)
+            {
                 if (!ec) {
                     write_queue_.pop();
+
                     if (!write_queue_.empty()) {
                         DoWrite();
                     }
@@ -359,101 +696,160 @@ private:
             });
     }
 
+private:
     boost::asio::io_context& io_context_;
     ssl::stream<tcp::socket> ssl_socket_;
-    std::atomic<bool> is_connected_{ false };
-    std::atomic<bool> is_connect_failed_{ false };
-    std::queue<std::vector<char>> write_queue_;
 
+    std::atomic<bool> is_connected_{ false };
+    std::atomic<uint32_t> user_id_{ 0 };
+    std::atomic<uint32_t> last_room_id_{ 0 };
+    std::atomic<uint32_t> current_room_owner_id_{ 0 };
+
+    std::queue<std::vector<char>> write_queue_;
     std::vector<char> header_buffer_;
     std::vector<char> payload_buffer_;
 
-    std::atomic<uint32_t> user_id_{ 0 };
-    std::string reconnect_token_;
-    std::atomic<uint32_t> last_room_id_{ 0 };
-    std::atomic<uint32_t> current_room_owner_id_{ 0 };
-    std::atomic<bool> room_created_flag_{ false };
-    std::atomic<bool> auth_response_received_{ false };
+    boost::asio::steady_timer ping_timer_{ io_context_ };
+
+    std::shared_ptr<std::promise<bool>> auth_promise_;
+    std::shared_ptr<std::promise<uint32_t>> room_promise_;
+    std::shared_ptr<std::promise<bool>> leave_promise_;
 };
 
-void RunRoomLoop(std::shared_ptr<ChatClient> client, uint32_t room_id) {
+//==================================================
+// Room Loop
+//==================================================
+void RunRoomLoop(std::shared_ptr<ChatClient> client, uint32_t room_id)
+{
     while (client->IsConnected()) {
         if (client->GetLastRoomId() == 0) break;
 
         std::string input;
         std::getline(std::cin, input);
+
         if (input.empty()) continue;
 
+        //==================================================
+        // Leave
+        //==================================================
         if (input == "/leave") {
-            chat::LeaveRoomRequest leave_req;
-            leave_req.set_room_id(room_id);
-            client->SendProtoMessage(MessageType::LEAVE_ROOM, leave_req);
-            client->SetLastRoomId(0);
-            client->SetCurrentRoomOwnerId(0);
-            client->SetRoomCreatedFlag(false);
-            break;
+            auto leave_promise = std::make_shared<std::promise<bool>>();
+            auto leave_future = leave_promise->get_future();
+
+            client->RegisterLeavePromise(leave_promise);
+
+            chat::LeaveRoomRequest req;
+            req.set_room_id(room_id);
+
+            client->SendProtoMessage(MessageType::LEAVE_ROOM, req);
+
+            // 서버 응답이 성공해야만 RoomLoop를 종료한다.
+            if (leave_future.get()) {
+                break;
+            }
+
+            std::cout << "[시스템] 방에 계속 남아 있습니다.\n";
         }
+
+        //==================================================
+        // History
+        //==================================================
         else if (input == "/history") {
             chat::ChatHistoryRequest req;
             req.set_room_id(room_id);
             req.set_last_message_id(0);
-            req.set_count(20); // 서버 요구 규격 count 적용
+            req.set_count(20);
+
             client->SendProtoMessage(MessageType::CHAT_HISTORY_REQUEST, req);
         }
+
+        //==================================================
+        // Kick
+        //==================================================
         else if (input.rfind("/kick ", 0) == 0) {
             if (!client->IsRoomOwner()) {
                 std::cout << "[시스템] 방장만 /kick 명령어를 사용할 수 있습니다.\n";
                 continue;
             }
+
             try {
                 uint32_t target_id = std::stoul(input.substr(6));
-                chat::KickUserRequest kick_req;
-                kick_req.set_room_id(room_id);
-                kick_req.set_target_user_id(target_id);
-                client->SendProtoMessage(MessageType::KICK_USER_REQUEST, kick_req);
+
+                chat::KickUserRequest req;
+                req.set_room_id(room_id);
+                req.set_target_user_id(target_id);
+
+                client->SendProtoMessage(MessageType::KICK_USER_REQUEST, req);
             } catch (const std::exception&) {
                 std::cout << "[시스템] 사용법: /kick [유저ID]\n";
             }
         }
+
+        //==================================================
+        // Transfer Master
+        //==================================================
         else if (input.rfind("/pass ", 0) == 0) {
             if (!client->IsRoomOwner()) {
                 std::cout << "[시스템] 방장만 /pass 명령어를 사용할 수 있습니다.\n";
                 continue;
             }
+
             try {
                 uint32_t target_id = std::stoul(input.substr(6));
-                chat::TransferMasterRequest pass_req;
-                pass_req.set_room_id(room_id);
-                pass_req.set_new_master_id(target_id);
-                client->SendProtoMessage(MessageType::TRANSFER_MASTER_REQUEST, pass_req);
+
+                chat::TransferMasterRequest req;
+                req.set_room_id(room_id);
+                req.set_new_master_id(target_id);
+
+                client->SendProtoMessage(MessageType::TRANSFER_MASTER_REQUEST, req);
             } catch (const std::exception&) {
                 std::cout << "[시스템] 사용법: /pass [유저ID]\n";
             }
         }
+
+        //==================================================
+        // Whisper
+        //==================================================
         else if (input.rfind("/w ", 0) == 0) {
             size_t space_pos = input.find(' ', 3);
-            if (space_pos != std::string::npos) {
-                std::string target_name = input.substr(3, space_pos - 3);
-                std::string msg = input.substr(space_pos + 1);
-                chat::WhisperRequest w_req;
-                w_req.set_target_username(target_name);
-                w_req.set_message(msg);
-                client->SendProtoMessage(MessageType::WHISPER_REQUEST, w_req);
+
+            if (space_pos == std::string::npos) {
+                std::cout << "[시스템] 사용법: /w [상대방이름] [내용]\n";
+                continue;
             }
+
+            std::string target_name = input.substr(3, space_pos - 3);
+            std::string message = input.substr(space_pos + 1);
+
+            chat::WhisperRequest req;
+            req.set_room_id(room_id);
+            req.set_target_username(target_name);
+            req.set_message(message);
+
+            client->SendProtoMessage(MessageType::WHISPER_REQUEST, req);
         }
+
+        //==================================================
+        // Chat
+        //==================================================
         else {
-            chat::ChatMessage chat_msg;
-            chat_msg.set_room_id(room_id);
-            chat_msg.set_sender_id(client->GetUserId());
-            chat_msg.set_message(input);
-            chat_msg.set_timestamp(std::chrono::duration_cast<std::chrono::seconds>(
+            chat::ChatMessage msg;
+            msg.set_room_id(room_id);
+            msg.set_sender_id(client->GetUserId());
+            msg.set_message(input);
+            msg.set_timestamp(std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
-            client->SendProtoMessage(MessageType::CHAT_MESSAGE, chat_msg);
+
+            client->SendProtoMessage(MessageType::CHAT_MESSAGE, msg);
         }
     }
 }
 
-int main() {
+//==================================================
+// Main
+//==================================================
+int main()
+{
     try {
         boost::asio::io_context io_context;
 
@@ -463,68 +859,74 @@ int main() {
         auto client = std::make_shared<ChatClient>(io_context, ssl_ctx);
         auto work_guard = boost::asio::make_work_guard(io_context);
 
-        std::thread io_thread([&io_context]() { io_context.run(); });
+        std::thread io_thread([&io_context]() {
+            io_context.run();
+        });
 
-        client->Start("127.0.0.1", "8080");
+        //==================================================
+        // Connect
+        //==================================================
+        auto connect_future = client->ConnectAsync("127.0.0.1", "8080");
 
-        while (!client->IsConnected() && !client->IsConnectFailed()) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-
-        if (client->IsConnectFailed()) {
+        if (!connect_future.get()) {
             work_guard.reset();
             if (io_thread.joinable()) io_thread.join();
             return 0;
         }
 
-        bool is_running = true;
-
-        // 1. 인증 메인 루프 (회원가입 / 로그인 / 토큰 재연결)
+        //==================================================
+        // Authentication
+        //==================================================
         while (client->IsConnected() && client->GetUserId() == 0) {
             std::cout << "\n=== [인증 메뉴] ===\n";
             std::cout << "1. 회원가입\n";
             std::cout << "2. 로그인\n";
             std::cout << "선택: ";
+
             int choice = 0;
             if (!(std::cin >> choice)) break;
 
-            if (choice == 1) {
-                std::string username, password;
-                std::cout << "아이디: "; std::cin >> username;
-                std::cout << "비밀번호: "; std::cin >> password;
+            if (choice != 1 && choice != 2) {
+                std::cout << "[시스템] 잘못된 선택입니다.\n";
+                continue;
+            }
 
+            std::string username;
+            std::string password;
+
+            std::cout << "아이디: ";
+            std::cin >> username;
+
+            std::cout << "비밀번호: ";
+            std::cin >> password;
+
+            auto auth_promise = std::make_shared<std::promise<bool>>();
+            auto auth_future = auth_promise->get_future();
+
+            client->RegisterAuthPromise(auth_promise);
+
+            if (choice == 1) {
                 chat::RegisterRequest req;
                 req.set_username(username);
                 req.set_password(password);
 
-                client->SetAuthResponseReceived(false);
                 client->SendProtoMessage(MessageType::REGISTER_REQUEST, req);
-
-                for (int i = 0; i < 500 && client->IsConnected(); ++i) {
-                    if (client->GetAuthResponseReceived()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
-            }
-            else if (choice == 2) {
-                std::string username, password;
-                std::cout << "아이디: "; std::cin >> username;
-                std::cout << "비밀번호: "; std::cin >> password;
-
+            } else {
                 chat::LoginRequest req;
                 req.set_username(username);
                 req.set_password(password);
 
-                client->SetAuthResponseReceived(false);
                 client->SendProtoMessage(MessageType::LOGIN_REQUEST, req);
-
-                for (int i = 0; i < 500 && client->IsConnected(); ++i) {
-                    if (client->GetAuthResponseReceived()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
             }
+
+            auth_future.get();
         }
 
-        // 2. 로그인 성공 후 메인 로비 루프
+        //==================================================
+        // Lobby
+        //==================================================
+        bool is_running = true;
+
         while (client->IsConnected() && is_running) {
             std::cout << "\n=== [메인 메뉴] (내 유저 ID: " << client->GetUserId() << ") ===\n";
             std::cout << "1. 방 목록 조회\n";
@@ -536,72 +938,101 @@ int main() {
             int menu_choice = 0;
             if (!(std::cin >> menu_choice)) break;
 
+            //==================================================
+            // Room List
+            //==================================================
             if (menu_choice == 1) {
                 chat::RoomListRequest req;
                 client->SendProtoMessage(MessageType::ROOM_LIST_REQUEST, req);
-                std::this_thread::sleep_for(std::chrono::milliseconds(200));
             }
+
+            //==================================================
+            // Create Room
+            //==================================================
             else if (menu_choice == 2) {
                 std::string room_name;
                 uint32_t max_users = 10;
-                std::cout << "방 제목: "; std::cin >> room_name;
-                std::cout << "최대 인원: "; std::cin >> max_users;
+
+                std::cout << "방 제목: ";
+                std::cin >> room_name;
+
+                std::cout << "최대 인원: ";
+                std::cin >> max_users;
+
+                auto room_promise = std::make_shared<std::promise<uint32_t>>();
+                auto room_future = room_promise->get_future();
+
+                client->RegisterRoomPromise(room_promise);
 
                 chat::CreateRoomRequest req;
                 req.set_room_name(room_name);
                 req.set_max_users(max_users);
 
-                client->SetLastRoomId(0);
-                client->SetCurrentRoomOwnerId(0);
-                client->SetRoomCreatedFlag(false);
                 client->SendProtoMessage(MessageType::CREATE_ROOM_REQUEST, req);
 
-                for (int i = 0; i < 500 && client->IsConnected(); ++i) {
-                    if (client->GetRoomCreatedFlag()) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+                uint32_t created_room_id = room_future.get();
 
-                const uint32_t created_room_id = client->GetLastRoomId();
                 if (created_room_id > 0) {
-                    std::cout << "\n>>> #" << created_room_id << "번 방 입장 ('/history': 기록, '/leave': 퇴장) <<<\n";
+                    std::cout << "\n>>> #" << created_room_id
+                              << "번 방 입장 ('/history': 기록, '/leave': 퇴장) <<<\n";
+
                     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
                     RunRoomLoop(client, created_room_id);
                 }
             }
+
+            //==================================================
+            // Join Room
+            //==================================================
             else if (menu_choice == 3) {
                 uint32_t target_room_id = 0;
-                std::cout << "입장할 방 번호: "; std::cin >> target_room_id;
 
-                chat::JoinRoomRequest join_req;
-                join_req.set_room_id(target_room_id);
+                std::cout << "입장할 방 번호: ";
+                std::cin >> target_room_id;
 
-                client->SetLastRoomId(0);
-                client->SetCurrentRoomOwnerId(0);
-                client->SendProtoMessage(MessageType::JOIN_ROOM, join_req);
+                auto room_promise = std::make_shared<std::promise<uint32_t>>();
+                auto room_future = room_promise->get_future();
 
-                for (int i = 0; i < 400 && client->IsConnected(); ++i) {
-                    if (client->GetLastRoomId() == target_room_id) break;
-                    std::this_thread::sleep_for(std::chrono::milliseconds(10));
-                }
+                client->RegisterRoomPromise(room_promise);
 
-                if (client->GetLastRoomId() == target_room_id) {
-                    std::cout << "\n>>> #" << target_room_id << "번 방 입장 ('/history': 기록, '/leave': 퇴장) <<<\n";
+                chat::JoinRoomRequest req;
+                req.set_room_id(target_room_id);
+
+                client->SendProtoMessage(MessageType::JOIN_ROOM, req);
+
+                uint32_t joined_room_id = room_future.get();
+
+                if (joined_room_id > 0) {
+                    std::cout << "\n>>> #" << joined_room_id
+                              << "번 방 입장 ('/history': 기록, '/leave': 퇴장) <<<\n";
+
                     std::cin.ignore(std::numeric_limits<std::streamsize>::max(), '\n');
-                    RunRoomLoop(client, target_room_id);
+                    RunRoomLoop(client, joined_room_id);
                 }
             }
+
+            //==================================================
+            // Exit
+            //==================================================
             else if (menu_choice == 4) {
                 is_running = false;
+            }
+
+            else {
+                std::cout << "[시스템] 잘못된 선택입니다.\n";
             }
         }
 
         client->Close();
         work_guard.reset();
-        if (io_thread.joinable()) io_thread.join();
 
-    } catch (const std::exception& e) {
-        std::cerr << "예외 발생: " << e.what() << std::endl;
+        if (io_thread.joinable()) {
+            io_thread.join();
+        }
     }
+    catch (const std::exception& e) {
+        std::cerr << "예외 발생: " << e.what() << '\n';
+    }
+
     return 0;
 }
-

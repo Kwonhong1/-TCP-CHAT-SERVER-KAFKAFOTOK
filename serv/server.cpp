@@ -4,6 +4,7 @@
 #include <boost/asio/detached.hpp>
 #include <boost/asio/use_awaitable.hpp>
 #include <boost/asio/experimental/channel.hpp>
+#include <boost/endian/conversion.hpp>
 
 #include <google/protobuf/io/coded_stream.h>
 #include <google/protobuf/io/zero_copy_stream_impl_lite.h>
@@ -132,17 +133,127 @@ inline bool HasPermission(
 // 패킷 헤더
 //==================================================
 
-#pragma pack(push, 1)
-
 struct PacketHeader
 {
-    uint16_t packet_size;
-    MessageType message_type;
-    uint32_t user_id;
-    uint32_t sequence_number;
+    uint16_t packet_size = 0;
+    MessageType message_type{};
+    uint32_t user_id = 0;
+    uint32_t sequence_number = 0;
 };
 
-#pragma pack(pop)
+constexpr std::size_t PACKET_HEADER_SIZE = 12;
+
+void EncodePacketHeader(
+    const PacketHeader& header,
+    char* dst)
+{
+    uint16_t packet_size =
+        boost::endian::native_to_little(
+            header.packet_size
+        );
+
+    uint16_t message_type =
+        boost::endian::native_to_little(
+            static_cast<uint16_t>(
+                header.message_type
+            )
+        );
+
+    uint32_t user_id =
+        boost::endian::native_to_little(
+            header.user_id
+        );
+
+    uint32_t sequence_number =
+        boost::endian::native_to_little(
+            header.sequence_number
+        );
+
+    std::memcpy(
+        dst + 0,
+        &packet_size,
+        sizeof(packet_size)
+    );
+
+    std::memcpy(
+        dst + 2,
+        &message_type,
+        sizeof(message_type)
+    );
+
+    std::memcpy(
+        dst + 4,
+        &user_id,
+        sizeof(user_id)
+    );
+
+    std::memcpy(
+        dst + 8,
+        &sequence_number,
+        sizeof(sequence_number)
+    );
+}
+
+
+PacketHeader DecodePacketHeader(
+    const char* src)
+{
+    uint16_t packet_size;
+    uint16_t message_type;
+    uint32_t user_id;
+    uint32_t sequence_number;
+
+    std::memcpy(
+        &packet_size,
+        src + 0,
+        sizeof(packet_size)
+    );
+
+    std::memcpy(
+        &message_type,
+        src + 2,
+        sizeof(message_type)
+    );
+
+    std::memcpy(
+        &user_id,
+        src + 4,
+        sizeof(user_id)
+    );
+
+    std::memcpy(
+        &sequence_number,
+        src + 8,
+        sizeof(sequence_number)
+    );
+
+    PacketHeader header{};
+
+    header.packet_size =
+        boost::endian::little_to_native(
+            packet_size
+        );
+
+    header.message_type =
+        static_cast<MessageType>(
+            boost::endian::little_to_native(
+                message_type
+            )
+        );
+
+    header.user_id =
+        boost::endian::little_to_native(
+            user_id
+        );
+
+    header.sequence_number =
+        boost::endian::little_to_native(
+            sequence_number
+        );
+
+    return header;
+}
+
 
 //==================================================
 // DB User
@@ -195,10 +306,9 @@ public:
 
         PacketHeader header{};
 
-        header.packet_size =
-            static_cast<uint16_t>(
-                sizeof(PacketHeader) + payload.size()
-            );
+        header.packet_size = static_cast<uint16_t>(
+                PACKET_HEADER_SIZE + payload.size()
+        );
 
         header.message_type = msg_type;
         header.user_id = user_id;
@@ -208,21 +318,19 @@ public:
             header.packet_size
         );
 
-        std::memcpy(
-            send_buffer.data(),
-            &header,
-            sizeof(PacketHeader)
+        EncodePacketHeader(
+            header,
+            send_buffer.data()
         );
 
         if (!payload.empty())
         {
             std::memcpy(
-                send_buffer.data() + sizeof(PacketHeader),
+                send_buffer.data() + PACKET_HEADER_SIZE,
                 payload.data(),
                 payload.size()
             );
         }
-
         return send_buffer;
     }
 
@@ -319,21 +427,33 @@ public:
     }
 
     int ReadPacket(
-        std::vector<char>& out_packet)
+    std::vector<char>& out_packet)
     {
-        if (size_ < sizeof(PacketHeader))
+        // 아직 헤더 12바이트조차 안 들어왔으면 대기
+        if (size_ < PACKET_HEADER_SIZE)
             return 0;
 
-        PacketHeader header{};
+        // Ring Buffer는 메모리가 중간에서 wrap될 수 있으므로
+        // 우선 wire header 12바이트를 연속된 임시 버퍼로 복사
+        char header_buffer[PACKET_HEADER_SIZE];
 
         PeekBytes(
-            reinterpret_cast<char*>(&header),
-            sizeof(PacketHeader)
+            header_buffer,
+            PACKET_HEADER_SIZE
         );
 
+        // Little Endian Wire Header
+        //        ↓
+        // 현재 CPU의 Native Endian
+        PacketHeader header =
+            DecodePacketHeader(
+                header_buffer
+            );
+
+        // 비정상 패킷 크기 검사
         if (
             header.packet_size > MAX_PACKET_SIZE ||
-            header.packet_size < sizeof(PacketHeader)
+            header.packet_size < PACKET_HEADER_SIZE
         )
         {
             std::cerr
@@ -344,9 +464,12 @@ public:
             return -1;
         }
 
+        // 전체 패킷이 아직 도착하지 않았으면 대기
         if (size_ < header.packet_size)
             return 0;
 
+        // 완전한 패킷이 도착했으므로
+        // wire format 그대로 꺼낸다.
         out_packet.resize(
             header.packet_size
         );
@@ -358,7 +481,6 @@ public:
 
         return 1;
     }
-
 private:
 
     void PeekBytes(
@@ -1154,21 +1276,34 @@ public:
                         self->WriteLoop(),
                         detached
                     );
-
                     PacketHeader prompt_header{};
-
                     prompt_header.packet_size =
-                        sizeof(PacketHeader);
-
+                        static_cast<uint16_t>(
+                            PACKET_HEADER_SIZE
+                        );
+                    
                     prompt_header.message_type =
                         MessageType::LOGIN_PROMPT;
-
+                    
                     prompt_header.user_id = 0;
                     prompt_header.sequence_number = 0;
+                    
+                    
+                    // Native Header
+                    //      ↓
+                    // Little Endian Wire Header
+                    std::vector<char> prompt_packet(
+                        PACKET_HEADER_SIZE
+                    );
+
+                    EncodePacketHeader(
+                        prompt_header,
+                        prompt_packet.data()
+                    );
 
                     self->Send(
-                        &prompt_header,
-                        sizeof(PacketHeader)
+                        prompt_packet.data(),
+                        prompt_packet.size()
                     );
 
                     co_await self->ReadLoop();
@@ -2857,43 +2992,58 @@ void ChatSession::Disconnect()
 //==================================================
 // ProcessPacket
 //==================================================
-
 awaitable<void>
 ChatSession::ProcessPacketAsync(
     const char* data,
     size_t size)
-{
-    if (
-        size < sizeof(PacketHeader)
-    )
-    {
-        co_return;
-    }
-
-    PacketHeader header{};
-
-    std::memcpy(
-        &header,
-        data,
-        sizeof(PacketHeader)
-    );
-
-    const char* payload =
-        data + sizeof(PacketHeader);
-
-    size_t payload_size =
-        size - sizeof(PacketHeader);
-
-    co_await
-        server_
-            .GetDispatcher()
-            .DispatchMessageAsync(
-                shared_from_this(),
-                header,
-                payload,
-                payload_size
-            );
-}
+        {
+            if (
+                size < PACKET_HEADER_SIZE
+            )
+            {
+                co_return;
+            }
+        
+            // Little Endian Wire Header
+            //          ↓
+            // 현재 CPU Native Header
+            PacketHeader header =
+                DecodePacketHeader(
+                    data
+                );
+            
+            // 실제 전달받은 패킷 크기와
+            // 헤더에 기록된 크기가 일치하는지 확인
+            if (
+                header.packet_size != size
+            )
+            {
+                std::cerr
+                    << "[Security] Packet size mismatch. Header: "
+                    << header.packet_size
+                    << ", Actual: "
+                    << size
+                    << std::endl;
+            
+                co_return;
+            }
+        
+            const char* payload =
+                data + PACKET_HEADER_SIZE;
+        
+            size_t payload_size =
+                size - PACKET_HEADER_SIZE;
+        
+            co_await
+                server_
+                    .GetDispatcher()
+                    .DispatchMessageAsync(
+                        shared_from_this(),
+                        header,
+                        payload,
+                        payload_size
+                    );
+        }
 
 //==================================================
 // ChatHandlers
@@ -2966,9 +3116,7 @@ public:
                     true
                 );
 
-                // [FIX]
-                // 기존 reconnect 성공 경로에서
-                // Redis session ONLINE 갱신이 빠져 있었다.
+                
                 co_await
                     server
                         .GetSessionRepository()
@@ -3773,31 +3921,41 @@ public:
     //--------------------------------------------------
     // Ping
     //--------------------------------------------------
-
     static awaitable<void> HandlePing(
         std::shared_ptr<ChatSession> session)
-    {
-        PacketHeader pong_header{};
-
-        pong_header.packet_size =
-            sizeof(PacketHeader);
-
-        pong_header.message_type =
-            MessageType::PONG;
-
-        pong_header.user_id =
-            session->GetUserId();
-
-        pong_header.sequence_number = 0;
-
-        session->Send(
-            &pong_header,
-            sizeof(PacketHeader)
-        );
-
-        co_return;
-    }
-};
+        {
+            PacketHeader pong_header{};
+        
+            pong_header.packet_size =
+                static_cast<uint16_t>(
+                    PACKET_HEADER_SIZE
+                );
+            
+            pong_header.message_type =
+                MessageType::PONG;
+            
+            pong_header.user_id =
+                session->GetUserId();
+            
+            pong_header.sequence_number = 0;
+            
+            std::vector<char> pong_packet(
+                PACKET_HEADER_SIZE
+            );
+        
+            EncodePacketHeader(
+                pong_header,
+                pong_packet.data()
+            );
+        
+            session->Send(
+                pong_packet.data(),
+                pong_packet.size()
+            );
+        
+            co_return;
+        }
+    };
 
 //==================================================
 // Handler 등록
