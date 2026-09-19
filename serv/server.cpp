@@ -28,6 +28,7 @@
 #include <random>
 #include <functional>
 #include <type_traits>
+#include <limits>
 
 using boost::asio::ip::tcp;
 using boost::asio::awaitable;
@@ -41,7 +42,7 @@ namespace ssl = boost::asio::ssl;
 // 상수
 //==================================================
 
-constexpr size_t MAX_PACKET_SIZE = 4 * 1024;
+constexpr size_t MAX_PACKET_SIZE = 20 * 1024;
 
 //==================================================
 // 메시지 타입
@@ -293,73 +294,43 @@ inline std::string GenerateReconnectToken()
 class PacketSerializer
 {
 public:
-
     template <typename T>
-    static std::vector<char> Serialize(
-        MessageType msg_type,
-        uint32_t user_id,
-        const T& proto_msg)
+    static std::vector<char> Serialize(MessageType msg_type, uint32_t user_id, const T& proto_msg)
     {
         std::string payload;
+        if (!proto_msg.SerializeToString(&payload)) {
+            std::cerr << "[Serialize Error] Protobuf serialization failed.\n";
+            return {};
+        }
 
-        proto_msg.SerializeToString(&payload);
+        const size_t total_size = PACKET_HEADER_SIZE + payload.size();
+        if (total_size > MAX_PACKET_SIZE || total_size > std::numeric_limits<uint16_t>::max()) {
+            std::cerr << "[Security] Outgoing packet too large: " << total_size << '\n';
+            return {};
+        }
 
         PacketHeader header{};
-
-        header.packet_size = static_cast<uint16_t>(
-                PACKET_HEADER_SIZE + payload.size()
-        );
-
+        header.packet_size = static_cast<uint16_t>(total_size);
         header.message_type = msg_type;
         header.user_id = user_id;
         header.sequence_number = 0;
 
-        std::vector<char> send_buffer(
-            header.packet_size
-        );
-
-        EncodePacketHeader(
-            header,
-            send_buffer.data()
-        );
-
-        if (!payload.empty())
-        {
-            std::memcpy(
-                send_buffer.data() + PACKET_HEADER_SIZE,
-                payload.data(),
-                payload.size()
-            );
-        }
+        std::vector<char> send_buffer(total_size);
+        EncodePacketHeader(header, send_buffer.data());
+        if (!payload.empty()) std::memcpy(send_buffer.data() + PACKET_HEADER_SIZE, payload.data(), payload.size());
         return send_buffer;
     }
 
     template <typename T>
-    static bool ParseProtoStream(
-        const char* payload,
-        size_t payload_size,
-        T& out_proto)
+    static bool ParseProtoStream(const char* payload, size_t payload_size, T& out_proto)
     {
-        if (!payload && payload_size > 0)
-            return false;
+        if (!payload && payload_size > 0) return false;
+        if (payload_size == 0) return true;
 
-        if (payload_size == 0)
-            return true;
-
-        google::protobuf::io::ArrayInputStream array_stream(
-            payload,
-            static_cast<int>(payload_size)
-        );
-
-        google::protobuf::io::CodedInputStream coded_stream(
-            &array_stream
-        );
-
+        google::protobuf::io::ArrayInputStream array_stream(payload, static_cast<int>(payload_size));
+        google::protobuf::io::CodedInputStream coded_stream(&array_stream);
         coded_stream.SetRecursionLimit(64);
-
-        return out_proto.ParseFromCodedStream(
-            &coded_stream
-        );
+        return out_proto.ParseFromCodedStream(&coded_stream);
     }
 };
 
@@ -377,7 +348,7 @@ class RingPacketBuffer
 public:
 
     explicit RingPacketBuffer(
-        size_t capacity = 16 * 1024)
+        size_t capacity = 32 * 1024)
         :
         buffer_(capacity),
         capacity_(capacity),
@@ -1400,17 +1371,9 @@ public:
                 )
                     return;
 
-                auto packet =
-                    PacketSerializer::Serialize(
-                        msg_type,
-                        self->user_id_,
-                        proto_msg
-                    );
-
-                self->write_channel_.try_send(
-                    boost::system::error_code{},
-                    std::move(packet)
-                );
+                auto packet = PacketSerializer::Serialize(msg_type, self->user_id_, proto_msg);
+                if (packet.empty()) return;
+                self->write_channel_.try_send(boost::system::error_code{}, std::move(packet));
             }
         );
     }
@@ -3271,104 +3234,30 @@ public:
     // Create Room
     //--------------------------------------------------
 
-    static awaitable<void> HandleCreateRoom(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::CreateRoomRequest& req)
+    static awaitable<void> HandleCreateRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::CreateRoomRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        uint32_t user_id =
-            session->GetUserId();
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .CreateRoomAsync(
-                        req.room_name(),
-                        req.max_users()
-                    );
-
-        auto user =
-            co_await
-                server
-                    .GetUserManager()
-                    .GetUserByIdAsync(
-                        user_id
-                    );
-
         chat::CreateRoomResponse res;
-
-        if (room && user)
-        {
-            bool added =
-                co_await
-                    room->AddUserAsync(
-                        user,
-                        RoomPermission::HOST
-                    );
-
-            if (added)
-            {
-                session->SetRoomId(
-                    room->GetId()
-                );
-
-                res.set_success(true);
-
-                res.set_created_room_id(
-                    room->GetId()
-                );
-
-                res.set_owner_id(
-                    user->GetId()
-                );
-            }
-            else
-            {
-                co_await
-                    server
-                        .GetRoomManager()
-                        .DestroyRoomAsync(
-                            room->GetId()
-                        );
-
-                res.set_success(false);
-
-                res.set_error_message(
-                    "ROOM_CREATE_FAILED"
-                );
-            }
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::CREATE_ROOM_RESPONSE, res); co_return;
         }
-        else
-        {
-            if (room)
-            {
-                co_await
-                    server
-                        .GetRoomManager()
-                        .DestroyRoomAsync(
-                            room->GetId()
-                        );
-            }
-
-            res.set_success(false);
-
-            res.set_error_message(
-                "ROOM_CREATE_FAILED"
-            );
+        if (session->GetRoomId() != 0) {
+            res.set_success(false); res.set_error_message("ALREADY_IN_ROOM");
+            session->Send(MessageType::CREATE_ROOM_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::CREATE_ROOM_RESPONSE,
-            res
-        );
+        uint32_t user_id = session->GetUserId();
+        auto room = co_await server.GetRoomManager().CreateRoomAsync(req.room_name(), req.max_users());
+        auto user = co_await server.GetUserManager().GetUserByIdAsync(user_id);
+
+        if (room && user && co_await room->AddUserAsync(user, RoomPermission::HOST)) {
+            session->SetRoomId(room->GetId());
+            res.set_success(true); res.set_created_room_id(room->GetId()); res.set_owner_id(user->GetId());
+        } else {
+            if (room) co_await server.GetRoomManager().DestroyRoomAsync(room->GetId());
+            res.set_success(false); res.set_error_message("ROOM_CREATE_FAILED");
+        }
+        session->Send(MessageType::CREATE_ROOM_RESPONSE, res);
     }
 
     //--------------------------------------------------
@@ -3414,231 +3303,97 @@ public:
     // Join
     //--------------------------------------------------
 
-    static awaitable<void> HandleJoinRoom(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::JoinRoomRequest& req)
+    static awaitable<void> HandleJoinRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::JoinRoomRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        uint32_t user_id =
-            session->GetUserId();
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .GetRoomAsync(
-                        req.room_id()
-                    );
-
-        auto user =
-            co_await
-                server
-                    .GetUserManager()
-                    .GetUserByIdAsync(
-                        user_id
-                    );
-
         chat::JoinRoomResponse res;
-
-        if (
-            room &&
-            user &&
-            co_await room->AddUserAsync(
-                user,
-                RoomPermission::MEMBER
-            )
-        )
-        {
-            session->SetRoomId(
-                room->GetId()
-            );
-
-            res.set_success(true);
-
-            res.set_room_id(
-                room->GetId()
-            );
-
-            res.set_owner_id(
-                co_await
-                    room->GetOwnerIdAsync()
-            );
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::JOIN_ROOM_RESPONSE, res); co_return;
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                "JOIN_FAILED_OR_FULL"
-            );
+        if (session->GetRoomId() != 0) {
+            res.set_success(false); res.set_error_message("ALREADY_IN_ROOM");
+            session->Send(MessageType::JOIN_ROOM_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::JOIN_ROOM_RESPONSE,
-            res
-        );
+        uint32_t user_id = session->GetUserId();
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        auto user = co_await server.GetUserManager().GetUserByIdAsync(user_id);
+
+        if (!room || !user || !co_await room->AddUserAsync(user, RoomPermission::MEMBER)) {
+            res.set_success(false); res.set_error_message("JOIN_FAILED_OR_FULL");
+            session->Send(MessageType::JOIN_ROOM_RESPONSE, res); co_return;
+        }
+
+        session->SetRoomId(room->GetId());
+        res.set_success(true); res.set_room_id(room->GetId()); res.set_owner_id(co_await room->GetOwnerIdAsync());
+
+        auto history = co_await server.GetChatRepository()->GetChatHistoryAsync(room->GetId(), 0, 20);
+        if (history.success) {
+            for (auto it = history.messages.rbegin(); it != history.messages.rend(); ++it) {
+                const auto& db_msg = *it;
+                auto* msg = res.add_recent_messages();
+                msg->set_message_id(db_msg.message_id()); msg->set_room_id(db_msg.room_id());
+                msg->set_sender_id(db_msg.sender_id()); msg->set_sender_username(db_msg.sender_name());
+                msg->set_message(db_msg.message()); msg->set_timestamp(db_msg.timestamp());
+                if (PACKET_HEADER_SIZE + res.ByteSizeLong() > MAX_PACKET_SIZE) {
+                    res.mutable_recent_messages()->RemoveLast(); break;
+                }
+            }
+        }
+        session->Send(MessageType::JOIN_ROOM_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Leave
     //--------------------------------------------------
 
-    static awaitable<void> HandleLeaveRoom(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::LeaveRoomRequest& req)
+    static awaitable<void> HandleLeaveRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::LeaveRoomRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .GetRoomAsync(
-                        req.room_id()
-                    );
-
         chat::LeaveRoomResponse res;
-
-        if (
-            room &&
-            co_await
-                room->RemoveUserAsync(
-                    session->GetUserId()
-                )
-        )
-        {
-            session->SetRoomId(0);
-
-            co_await
-                server
-                    .GetRoomManager()
-                    .DestroyRoomIfEmptyAsync(
-                        room->GetId(),
-                        room
-                    );
-
-            res.set_success(true);
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                "LEAVE_FAILED"
-            );
+        if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
+            res.set_success(false); res.set_error_message("INVALID_ROOM");
+            session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::LEAVE_ROOM_RESPONSE,
-            res
-        );
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        if (!room || !co_await room->RemoveUserAsync(session->GetUserId())) {
+            res.set_success(false); res.set_error_message("LEAVE_FAILED");
+            session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
+        }
+
+        session->SetRoomId(0);
+        co_await server.GetRoomManager().DestroyRoomIfEmptyAsync(room->GetId(), room);
+        res.set_success(true);
+        session->Send(MessageType::LEAVE_ROOM_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Chat
     //--------------------------------------------------
 
-    static awaitable<void> HandleChatMessage(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::ChatMessage& msg_param)
+    static awaitable<void> HandleChatMessage(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::ChatMessage& msg_param)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
+        if (!session->IsAuthenticated()) co_return;
+        uint32_t user_id = session->GetUserId();
+        chat::ChatMessage msg = msg_param;
+        if (session->GetRoomId() == 0 || session->GetRoomId() != msg.room_id()) co_return;
 
-        uint32_t user_id =
-            session->GetUserId();
+        auto room = co_await server.GetRoomManager().GetRoomAsync(msg.room_id());
+        auto user = co_await server.GetUserManager().GetUserByIdAsync(user_id);
+        if (room && user && co_await room->HasUserAsync(user_id)) {
+            msg.set_sender_id(user_id); msg.set_sender_username(user->GetUsername());
+            room->BroadcastMessage(MessageType::CHAT_MESSAGE, msg);
 
-        chat::ChatMessage msg =
-            msg_param;
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .GetRoomAsync(
-                        msg.room_id()
-                    );
-
-        auto user =
-            co_await
-                server
-                    .GetUserManager()
-                    .GetUserByIdAsync(
-                        user_id
-                    );
-
-        if (
-            room &&
-            user &&
-            co_await
-                room->HasUserAsync(
-                    user_id
-                )
-        )
-        {
-            msg.set_sender_id(
-                user_id
-            );
-
-            msg.set_sender_username(
-                user->GetUsername()
-            );
-
-            room->BroadcastMessage(
-                MessageType::CHAT_MESSAGE,
-                msg
-            );
-
-            uint32_t room_id =
-                msg.room_id();
-
-            std::string text =
-                msg.message();
-
-            int64_t timestamp =
-                msg.timestamp();
-
-            co_spawn(
-                server.GetIOContext(),
-
-                [&server,
-                 room_id,
-                 user_id,
-                 text = std::move(text),
-                 timestamp]()
-                -> awaitable<void>
-                {
-                    co_await
-                        server
-                            .GetChatRepository()
-                            ->PublishChatAsync(
-                                room_id,
-                                user_id,
-                                text,
-                                timestamp
-                            );
-                },
-
-                detached
-            );
+            uint32_t room_id = msg.room_id();
+            std::string text = msg.message();
+            int64_t timestamp = msg.timestamp();
+            co_spawn(server.GetIOContext(), [&server, room_id, user_id, text = std::move(text), timestamp]() -> awaitable<void> {
+                co_await server.GetChatRepository()->PublishChatAsync(room_id, user_id, text, timestamp);
+            }, detached);
         }
     }
 
@@ -3646,315 +3401,153 @@ public:
     // History
     //--------------------------------------------------
 
-    static awaitable<void> HandleChatHistory(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::ChatHistoryRequest& req)
+    static awaitable<void> HandleChatHistory(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::ChatHistoryRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
+        chat::ChatHistoryResponse res;
+        res.set_room_id(req.room_id());
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
+        }
+        if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
+            res.set_success(false); res.set_error_message("NOT_IN_ROOM");
+            session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
         }
 
-        auto result =
-            co_await
-                server
-                    .GetChatRepository()
-                    ->GetChatHistoryAsync(
-                        req.room_id(),
-                        req.last_message_id(),
-                        req.count()
-                    );
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        if (!room || !co_await room->HasUserAsync(session->GetUserId())) {
+            res.set_success(false); res.set_error_message("NOT_IN_ROOM");
+            session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
+        }
 
-        chat::ChatHistoryResponse res;
+        uint32_t count = req.count();
+        if (count == 0) count = 20;
+        if (count > 100) count = 100;
+        auto result = co_await server.GetChatRepository()->GetChatHistoryAsync(req.room_id(), req.last_message_id(), count);
+        if (!result.success) {
+            res.set_success(false); res.set_error_message(result.error_msg);
+            session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
+        }
 
-        res.set_room_id(
-            req.room_id()
-        );
-
-        if (result.success)
-        {
-            res.set_success(true);
-
-            res.set_has_more(
-                result.has_more
-            );
-
-            for (
-                const auto& db_msg :
-                result.messages
-            )
-            {
-                auto* msg =
-                    res.add_messages();
-
-                msg->set_message_id(
-                    db_msg.message_id()
-                );
-
-                msg->set_room_id(
-                    db_msg.room_id()
-                );
-
-                msg->set_sender_id(
-                    db_msg.sender_id()
-                );
-
-                msg->set_sender_username(
-                    db_msg.sender_name()
-                );
-
-                msg->set_message(
-                    db_msg.message()
-                );
-
-                msg->set_timestamp(
-                    db_msg.timestamp()
-                );
+        res.set_success(true); res.set_has_more(result.has_more);
+        for (const auto& db_msg : result.messages) {
+            auto* msg = res.add_messages();
+            msg->set_message_id(db_msg.message_id()); msg->set_room_id(db_msg.room_id());
+            msg->set_sender_id(db_msg.sender_id()); msg->set_sender_username(db_msg.sender_name());
+            msg->set_message(db_msg.message()); msg->set_timestamp(db_msg.timestamp());
+            if (PACKET_HEADER_SIZE + res.ByteSizeLong() > MAX_PACKET_SIZE) {
+                res.mutable_messages()->RemoveLast(); res.set_has_more(true); break;
             }
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                result.error_msg
-            );
-        }
-
-        session->Send(
-            MessageType::CHAT_HISTORY_RESPONSE,
-            res
-        );
+        session->Send(MessageType::CHAT_HISTORY_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Whisper
     //--------------------------------------------------
 
-    static awaitable<void> HandleWhisper(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::WhisperRequest& req)
+    static awaitable<void> HandleWhisper(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::WhisperRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        auto sender =
-            co_await
-                server
-                    .GetUserManager()
-                    .GetUserByIdAsync(
-                        session->GetUserId()
-                    );
-
-        auto target =
-            co_await
-                server
-                    .GetUserManager()
-                    .GetUserByNameAsync(
-                        req.target_username()
-                    );
-
         chat::WhisperResponse res;
-
-        if (sender && target)
-        {
-            auto target_session =
-                co_await
-                    target
-                        ->GetSessionAsync();
-
-            if (target_session)
-            {
-                chat::WhisperNotification noti;
-
-                noti.set_sender_username(
-                    sender->GetUsername()
-                );
-
-                noti.set_message(
-                    req.message()
-                );
-
-                target_session->Send(
-                    MessageType::WHISPER_NOTIFICATION,
-                    noti
-                );
-
-                res.set_success(true);
-            }
-            else
-            {
-                res.set_success(false);
-
-                res.set_error_message(
-                    "USER_OFFLINE"
-                );
-            }
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                "TARGET_NOT_FOUND"
-            );
+        if (req.room_id() == 0 || session->GetRoomId() != req.room_id()) {
+            res.set_success(false); res.set_error_message("INVALID_ROOM");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::WHISPER_RESPONSE,
-            res
-        );
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        if (!room || !co_await room->HasUserAsync(session->GetUserId())) {
+            res.set_success(false); res.set_error_message("NOT_IN_ROOM");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
+        }
+
+        auto sender = co_await server.GetUserManager().GetUserByIdAsync(session->GetUserId());
+        auto target = co_await server.GetUserManager().GetUserByNameAsync(req.target_username());
+        if (!sender || !target) {
+            res.set_success(false); res.set_error_message("TARGET_NOT_FOUND");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
+        }
+        if (!co_await room->HasUserAsync(target->GetId())) {
+            res.set_success(false); res.set_error_message("TARGET_NOT_IN_ROOM");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
+        }
+
+        auto target_session = co_await target->GetSessionAsync();
+        if (!target_session) {
+            res.set_success(false); res.set_error_message("USER_OFFLINE");
+            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
+        }
+
+        chat::WhisperNotification noti;
+        noti.set_sender_username(sender->GetUsername()); noti.set_message(req.message());
+        target_session->Send(MessageType::WHISPER_NOTIFICATION, noti);
+        res.set_success(true);
+        session->Send(MessageType::WHISPER_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Kick
     //--------------------------------------------------
 
-    static awaitable<void> HandleKickUser(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::KickUserRequest& req)
+    static awaitable<void> HandleKickUser(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::KickUserRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .GetRoomAsync(
-                        req.room_id()
-                    );
-
         chat::KickUserResponse res;
-
-        if (
-            room &&
-            co_await
-                room->KickUserAsync(
-                    session->GetUserId(),
-                    req.target_user_id()
-                )
-        )
-        {
-            res.set_success(true);
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::KICK_USER_RESPONSE, res); co_return;
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                "KICK_PERMISSION_DENIED_OR_NO_USER"
-            );
+        if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
+            res.set_success(false); res.set_error_message("NOT_IN_ROOM");
+            session->Send(MessageType::KICK_USER_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::KICK_USER_RESPONSE,
-            res
-        );
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        if (room && co_await room->KickUserAsync(session->GetUserId(), req.target_user_id())) res.set_success(true);
+        else { res.set_success(false); res.set_error_message("KICK_PERMISSION_DENIED_OR_NO_USER"); }
+        session->Send(MessageType::KICK_USER_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Transfer master
     //--------------------------------------------------
 
-    static awaitable<void> HandleTransferMaster(
-        ChatServer& server,
-        std::shared_ptr<ChatSession> session,
-        const chat::TransferMasterRequest& req)
+    static awaitable<void> HandleTransferMaster(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::TransferMasterRequest& req)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
-
-        auto room =
-            co_await
-                server
-                    .GetRoomManager()
-                    .GetRoomAsync(
-                        req.room_id()
-                    );
-
         chat::TransferMasterResponse res;
-
-        if (
-            room &&
-            co_await
-                room->TransferMasterAsync(
-                    session->GetUserId(),
-                    req.new_master_id()
-                )
-        )
-        {
-            res.set_success(true);
+        if (!session->IsAuthenticated()) {
+            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
+            session->Send(MessageType::TRANSFER_MASTER_RESPONSE, res); co_return;
         }
-        else
-        {
-            res.set_success(false);
-
-            res.set_error_message(
-                "TRANSFER_FAILED_NOT_HOST"
-            );
+        if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
+            res.set_success(false); res.set_error_message("NOT_IN_ROOM");
+            session->Send(MessageType::TRANSFER_MASTER_RESPONSE, res); co_return;
         }
 
-        session->Send(
-            MessageType::TRANSFER_MASTER_RESPONSE,
-            res
-        );
+        auto room = co_await server.GetRoomManager().GetRoomAsync(req.room_id());
+        if (room && co_await room->TransferMasterAsync(session->GetUserId(), req.new_master_id())) res.set_success(true);
+        else { res.set_success(false); res.set_error_message("TRANSFER_FAILED_NOT_HOST"); }
+        session->Send(MessageType::TRANSFER_MASTER_RESPONSE, res);
     }
 
     //--------------------------------------------------
     // Ping
     //--------------------------------------------------
-    static awaitable<void> HandlePing(
-        std::shared_ptr<ChatSession> session)
-        {
-            PacketHeader pong_header{};
-        
-            pong_header.packet_size =
-                static_cast<uint16_t>(
-                    PACKET_HEADER_SIZE
-                );
-            
-            pong_header.message_type =
-                MessageType::PONG;
-            
-            pong_header.user_id =
-                session->GetUserId();
-            
-            pong_header.sequence_number = 0;
-            
-            std::vector<char> pong_packet(
-                PACKET_HEADER_SIZE
-            );
-        
-            EncodePacketHeader(
-                pong_header,
-                pong_packet.data()
-            );
-        
-            session->Send(
-                pong_packet.data(),
-                pong_packet.size()
-            );
-        
-            co_return;
-        }
+    static awaitable<void> HandlePing(std::shared_ptr<ChatSession> session)
+    {
+        PacketHeader pong_header{};
+        pong_header.packet_size = static_cast<uint16_t>(PACKET_HEADER_SIZE);
+        pong_header.message_type = MessageType::PONG;
+        pong_header.user_id = session->GetUserId();
+        pong_header.sequence_number = 0;
+
+        std::vector<char> pong_packet(PACKET_HEADER_SIZE);
+        EncodePacketHeader(pong_header, pong_packet.data());
+        session->Send(pong_packet.data(), pong_packet.size());
+        co_return;
+    }
     };
 
 //==================================================

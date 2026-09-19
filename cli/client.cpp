@@ -19,7 +19,7 @@
 using boost::asio::ip::tcp;
 namespace ssl = boost::asio::ssl;
 
-constexpr size_t MAX_PACKET_SIZE = 4 * 1024;
+constexpr size_t MAX_PACKET_SIZE = 20 * 1024;
 constexpr std::size_t PACKET_HEADER_SIZE = 12;
 
 //==================================================
