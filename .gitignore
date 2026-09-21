@@ -1,14 +1,23 @@
-.bash_history
-.bashrc
-.cache/
-.config/
-.docker/
-.lesshst
-.local/
-.ssh/
-.vim/
-.viminfo
+# CMake / C++ build
 build/
 build_server/
--TCP-CHAT-SERVER-KAFKAFOTOK/
-go/pkg/mod/
+**/build/
+
+# Node.js
+node_modules/
+npm-debug.log*
+
+# Local TLS certificates / private keys
+*.key
+*.pem
+*.crt
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Temporary files
+*.log
+*.tmp
+
+
