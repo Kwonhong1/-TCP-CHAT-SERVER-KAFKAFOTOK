@@ -11,3 +11,4 @@
 build/
 build_server/
 -TCP-CHAT-SERVER-KAFKAFOTOK/
+go/pkg/mod/
