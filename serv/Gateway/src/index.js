@@ -3,6 +3,11 @@ import tls from "node:tls";
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT = 8080;
 
+const HEADER_SIZE = 12;
+const MAX_PACKET_SIZE = 20 * 1024;
+
+let receiveBuffer = Buffer.alloc(0);
+
 const socket = tls.connect({
     host: SERVER_HOST,
     port: SERVER_PORT,
@@ -14,8 +19,11 @@ socket.on("secureConnect", () => {
 });
 
 socket.on("data", (chunk) => {
-    console.log(`[Gateway] Received ${chunk.length} bytes`);
-    console.log(chunk);
+    console.log(`[Gateway] Received chunk: ${chunk.length} bytes`);
+
+    receiveBuffer = Buffer.concat([receiveBuffer, chunk]);
+
+    processPackets();
 });
 
 socket.on("error", (err) => {
@@ -25,3 +33,40 @@ socket.on("error", (err) => {
 socket.on("close", () => {
     console.log("[Gateway] C++ server connection closed");
 });
+
+function processPackets() {
+    while (receiveBuffer.length >= HEADER_SIZE) {
+        const packetSize = receiveBuffer.readUInt16LE(0);
+
+        if (packetSize < HEADER_SIZE || packetSize > MAX_PACKET_SIZE) {
+            console.error(`[Gateway] Invalid packet size: ${packetSize}`);
+            socket.destroy();
+            return;
+        }
+
+        if (receiveBuffer.length < packetSize) {
+            return;
+        }
+
+        const packet = receiveBuffer.subarray(0, packetSize);
+        receiveBuffer = receiveBuffer.subarray(packetSize);
+
+        handlePacket(packet);
+    }
+}
+
+function handlePacket(packet) {
+    const packetSize = packet.readUInt16LE(0);
+    const messageType = packet.readUInt16LE(2);
+    const userId = packet.readUInt32LE(4);
+    const sequenceNumber = packet.readUInt32LE(8);
+
+    const payload = packet.subarray(HEADER_SIZE);
+
+    console.log("[Gateway] Packet");
+    console.log(`  size     : ${packetSize}`);
+    console.log(`  type     : ${messageType}`);
+    console.log(`  userId   : ${userId}`);
+    console.log(`  sequence : ${sequenceNumber}`);
+    console.log(`  payload  : ${payload.length} bytes`);
+}

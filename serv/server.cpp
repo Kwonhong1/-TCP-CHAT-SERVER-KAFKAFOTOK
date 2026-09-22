@@ -109,7 +109,7 @@ enum class RoomPermission : uint32_t
         DELEGATE_HOST
 };
 
-inline RoomPermission operator|(
+RoomPermission operator|(
     RoomPermission a,
     RoomPermission b)
 {
@@ -119,7 +119,7 @@ inline RoomPermission operator|(
     );
 }
 
-inline bool HasPermission(
+bool HasPermission(
     RoomPermission user_perm,
     RoomPermission required_perm)
 {
