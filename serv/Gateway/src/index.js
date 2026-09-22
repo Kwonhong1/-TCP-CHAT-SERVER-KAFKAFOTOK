@@ -121,7 +121,9 @@ function sendLogin(username, password, reconnectToken = "") {
         password,
         reconnectToken
     });
-
+    message.username="hololo";
+    message.password="1324";
+    message.reconnectToken="";
     const payload = LoginRequest.encode(message).finish();
 
     const packet = makePacket(
