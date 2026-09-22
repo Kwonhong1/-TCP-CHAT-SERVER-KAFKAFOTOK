@@ -31,7 +31,7 @@ socket.on("data", (chunk) => {
 
     receiveBuffer = Buffer.concat([receiveBuffer, chunk]);
 
-    processPackets();
+    processPacket();
 });
 
 socket.on("error", (err) => {
