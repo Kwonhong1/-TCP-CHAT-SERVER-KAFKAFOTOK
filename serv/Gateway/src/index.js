@@ -149,23 +149,3 @@ function handleLoginResponse(payload) {
         console.error("[Gateway] Failed to decode LoginResponse:", err.message);
     }
 }
-function sendLogin(username, password, reconnectToken = "") {
-    const message = LoginRequest.create({
-        username,
-        password,
-        reconnectToken
-    });
-
-    const payload = LoginRequest.encode(message).finish();
-
-    const packet = makePacket(
-        1001,
-        0,
-        1,
-        Buffer.from(payload)
-    );
-
-    console.log(`[Gateway] Sending LOGIN_REQUEST: ${packet.length} bytes`);
-
-    socket.write(packet);
-}
