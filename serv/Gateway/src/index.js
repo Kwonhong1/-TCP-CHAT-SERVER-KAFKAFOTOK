@@ -1,11 +1,11 @@
 import tls from "node:tls";
 import protobuf from "protobufjs";
+import { WebSocketServer } from "ws";
+
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT = 8080;
 const HEADER_SIZE = 12;
 const MAX_PACKET_SIZE = 20 * 1024;
-
-
 
 
 const root = await protobuf.load("../chat_protocol.proto");
@@ -15,6 +15,8 @@ const LoginRequest = root.lookupType("chat.LoginRequest");
 const LoginResponse = root.lookupType("chat.LoginResponse");
 
 let receiveBuffer = Buffer.alloc(0);
+
+
 
 const socket = tls.connect({
     host: SERVER_HOST,
@@ -42,6 +44,40 @@ socket.on("close", () => {
     console.log("[Gateway] C++ server connection closed");
 });
 
+const WS_PORT = 3000;
+
+const wss = new WebSocketServer({
+    port: WS_PORT
+});
+
+wss.on("listening", () => {
+    console.log(`[Gateway] WebSocket server listening on port ${WS_PORT}`);
+});
+
+wss.on("connection", (ws) => {
+    console.log("[Gateway] Browser connected");
+
+    ws.on("message", (data) => {
+        console.log("[Gateway] Browser message:", data.toString());
+    });
+
+    ws.on("close", () => {
+        console.log("[Gateway] Browser disconnected");
+    });
+
+    ws.on("error", (err) => {
+        console.error("[Gateway] WebSocket error:", err.message);
+    });
+});
+
+
+
+
+
+
+
+
+//=======================================================
 function processPacket() {
     while (receiveBuffer.length >= HEADER_SIZE) {
         const packetSize = receiveBuffer.readUInt16LE(0);
