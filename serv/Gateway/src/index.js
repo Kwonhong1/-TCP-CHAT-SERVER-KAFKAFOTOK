@@ -44,7 +44,7 @@ socket.on("close", () => {
     console.log("[Gateway] C++ server connection closed");
 });
 
-const WS_PORT = 3000;
+const WS_PORT = 8081;
 
 const wss = new WebSocketServer({
     port: WS_PORT
