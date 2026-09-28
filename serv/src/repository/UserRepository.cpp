@@ -15,7 +15,7 @@ UserRepository::UserRepository(
     // [FIX] gRPC context/request/response lifetime 보장
     //==================================================
 
-    awaitable<AuthResult> UserRepository::AuthenticateUserAsync(
+    awaitable<UserRepository::AuthResult> UserRepository::AuthenticateUserAsync(
         std::string username,
         std::string password)
 {
@@ -115,7 +115,7 @@ UserRepository::UserRepository(
         );
     }
 
-awaitable<RegisterResult> UserRepository::RegisterUserAsync(
+awaitable<UserRepository::RegisterResult> UserRepository::RegisterUserAsync(
         std::string username,
         std::string password)
 {
@@ -207,7 +207,7 @@ awaitable<RegisterResult> UserRepository::RegisterUserAsync(
         );
     }
 
-awaitable<VerifyTokenResult> UserRepository::VerifyTokenAsync(
+awaitable<UserRepository::VerifyTokenResult> UserRepository::VerifyTokenAsync(
         std::string token)
 {
         auto executor =
