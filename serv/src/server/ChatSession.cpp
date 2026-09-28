@@ -29,7 +29,7 @@ void ChatSession::Disconnect()
     room_id_ = 0;
     is_authenticated_ = false;
 
-    if (cur_user_id !)
+    if (cur_user_id !=0)
     {
         co_spawn(
             server_.GetIOContext(),
