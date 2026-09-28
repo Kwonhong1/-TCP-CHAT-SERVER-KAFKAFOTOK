@@ -105,8 +105,7 @@ awaitable<uint32_t> ChatRoom::GetOwnerIdAsync()
 
     awaitable<bool> ChatRoom::AddUserAsync(
         std::shared_ptr<User> user,
-        RoomPermission perm =
-            RoomPermission::MEMBER)
+        RoomPermission perm)
 {
         co_await boost::asio::dispatch(
             strand_,
