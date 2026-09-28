@@ -91,7 +91,7 @@ awaitable<bool> ChatRepository::PublishChatAsync(
         );
     }
 
-awaitable<ChatHistoryResult>
+awaitable<ChatRepository::ChatHistoryResult>
     ChatRepository::GetChatHistoryAsync(
         uint32_t room_id,
         uint64_t last_msg_id,
