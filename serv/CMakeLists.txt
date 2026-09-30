@@ -61,7 +61,24 @@ add_custom_command(
 # 4. C++ 메인 서버 (cpp_server) 빌드
 # =========================================================================
 add_executable(cpp_server
-    server.cpp
+    src/main.cpp
+    src/protocol/Protocol.cpp
+    src/protocol/RingPacketBuffer.cpp
+    src/repository/UserRepository.cpp
+    src/repository/SessionRepository.cpp
+    src/repository/ChatRepository.cpp
+    src/user/User.cpp
+    src/user/UserManager.cpp
+    src/room/ChatRoom.cpp
+    src/room/RoomManager.cpp
+    src/handler/MessageDispatcher.cpp
+    src/server/ChatSession.cpp
+    src/server/ChatServer.cpp
+    src/handler/AuthHandler.cpp
+    src/handler/RoomHandler.cpp
+    src/handler/ChatHandler.cpp
+    src/handler/AdminHandler.cpp
+    src/handler/SystemHandler.cpp
     ${NET_PROTO_SRC} ${NET_PROTO_HDR}
     ${DB_PROTO_SRC} ${DB_PROTO_HDR}
     ${DB_GRPC_SRC} ${DB_GRPC_HDR}
@@ -72,6 +89,7 @@ target_compile_options(cpp_server PRIVATE -fsanitize=address -g -O1)
 target_link_options(cpp_server PRIVATE -fsanitize=address)
 
 target_include_directories(cpp_server PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/include
     ${BOOST_INCLUDE_DIR}
     ${PROTOBUF_INCLUDE_DIRS}
     ${CMAKE_CURRENT_BINARY_DIR}
