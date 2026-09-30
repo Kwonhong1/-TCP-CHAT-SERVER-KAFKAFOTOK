@@ -4,5 +4,9 @@
   "type": "module",
   "scripts": {
     "start": "node src/index.js"
+  },
+  "dependencies": {
+    "protobufjs": "^8.8.0",
+    "ws": "^8.21.3"
   }
 }
