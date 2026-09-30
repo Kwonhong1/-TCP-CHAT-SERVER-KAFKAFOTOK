@@ -195,11 +195,13 @@ void ChatSession::Start()
                             );
 
                     self->StartIdleTimer();
-
-                    co_spawn(
-                        self->strand_,
-                        self->WriteLoop(),
-                        detached
+                    auto write_self=shared_form_this();
+                    co_spawn(self->strand_,
+                    [self]() -> awaitable<void>
+                    {
+                        co_await self->WriteLoop();
+                    },
+                    detached
                     );
                     PacketHeader prompt_header{};
                     prompt_header.packet_size =
