@@ -56,6 +56,8 @@ class RoomManager
             uint32_t room_id,
             std::shared_ptr<ChatRoom> expected_room);
 
+        awaitable<bool> RemoveUserAndCleanupRoomAsync(uint32_t room_id, uint32_t user_id);
+
 private:
 
     boost::asio::io_context& io_context_;

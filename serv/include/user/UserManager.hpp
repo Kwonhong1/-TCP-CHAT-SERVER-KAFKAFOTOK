@@ -22,6 +22,8 @@ class UserManager
     awaitable<std::shared_ptr<User>>
         GetUserByNameAsync(
             const std::string& username);
+    awaitable<void> SetUserOfflineAsync(
+    uint32_t user_id);
 
 private:
 

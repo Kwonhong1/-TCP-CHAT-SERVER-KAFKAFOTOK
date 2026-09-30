@@ -99,3 +99,35 @@ awaitable<std::shared_ptr<User>>
 
         co_return it->second;
     }
+//--------------------------------------------------
+// Disconnect cleanup
+//--------------------------------------------------
+
+awaitable<void>
+UserManager::SetUserOfflineAsync(
+    uint32_t user_id)
+{
+    co_await boost::asio::dispatch(
+        strand_,
+        use_awaitable
+    );
+
+    auto it =
+        users_by_id_.find(
+            user_id
+        );
+
+    if (
+        it == users_by_id_.end()
+    )
+    {
+        co_return;
+    }
+
+    auto user =
+        it->second;
+
+    co_await user->SetOnlineAsync(
+        false
+    );
+}8

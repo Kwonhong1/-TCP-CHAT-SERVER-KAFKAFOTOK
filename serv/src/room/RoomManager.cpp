@@ -223,3 +223,32 @@
 
         co_return true;
     }
+//--------------------------------------------------
+// Disconnect cleanup
+//--------------------------------------------------
+
+awaitable<bool>
+RoomManager::RemoveUserAndCleanupRoomAsync(
+    uint32_t room_id,
+    uint32_t user_id)
+{
+    auto room =
+        co_await GetRoomAsync(
+            room_id
+        );
+
+    if (!room)
+        co_return false;
+
+    co_await room->RemoveUserAsync(
+        user_id
+    );
+
+    bool destroyed =
+        co_await DestroyRoomIfEmptyAsync(
+            room_id,
+            room
+        );
+
+    co_return destroyed;
+}

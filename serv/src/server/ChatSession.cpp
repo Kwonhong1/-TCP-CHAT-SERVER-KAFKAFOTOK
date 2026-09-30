@@ -1,7 +1,5 @@
 #include "server/ChatSession.hpp"
 #include "server/ChatServer.hpp"
-#include "room/ChatRoom.hpp"
-#include "user/User.hpp"
 #include <iostream>
 
 void ChatSession::Disconnect()
@@ -13,12 +11,6 @@ void ChatSession::Disconnect()
         return;
     }
 
-    // Disconnect는 여러 경로에서 들어올 수 있으므로
-    // session 상태 정리는 session strand로 넘긴다.
-    //
-    // destructor 경로에서는 shared_from_this()가 위험할 수 있으므로
-    // 여기서는 기존 구조와 동일하게 atomic guard를 유지한다.
-
     uint32_t cur_user_id =
         user_id_;
 
@@ -29,7 +21,7 @@ void ChatSession::Disconnect()
     room_id_ = 0;
     is_authenticated_ = false;
 
-    if (cur_user_id !=0)
+    if (cur_user_id != 0)
     {
         co_spawn(
             server_.GetIOContext(),
@@ -39,55 +31,30 @@ void ChatSession::Disconnect()
              cur_room_id]()
             -> awaitable<void>
             {
-                auto user =
-                    co_await
-                        server_ptr
-                            ->GetUserManager()
-                            .GetUserByIdAsync(
-                                cur_user_id
-                            );
-
-                if (user)
-                {
-                    co_await
-                        user->SetOnlineAsync(
-                            false
+                co_await
+                    server_ptr
+                        ->GetUserManager()
+                        .SetUserOfflineAsync(
+                            cur_user_id
                         );
-                }
 
                 if (cur_room_id != 0)
                 {
-                    auto room =
+                    bool destroyed =
                         co_await
                             server_ptr
                                 ->GetRoomManager()
-                                .GetRoomAsync(
-                                    cur_room_id
+                                .RemoveUserAndCleanupRoomAsync(
+                                    cur_room_id,
+                                    cur_user_id
                                 );
 
-                    if (room)
+                    if (destroyed)
                     {
-                        co_await
-                            room->RemoveUserAsync(
-                                cur_user_id
-                            );
-
-                        bool destroyed =
-                            co_await
-                                server_ptr
-                                    ->GetRoomManager()
-                                    .DestroyRoomIfEmptyAsync(
-                                        cur_room_id,
-                                        room
-                                    );
-
-                        if (destroyed)
-                        {
-                            std::cout
-                                << "[Room Cleanup] #"
-                                << cur_room_id
-                                << "번 방의 모든 유저가 나갔으므로 방을 파괴했습니다.\n";
-                        }
+                        std::cout
+                            << "[Room Cleanup] #"
+                            << cur_room_id
+                            << "번 방의 모든 유저가 나갔으므로 방을 파괴했습니다.\n";
                     }
                 }
 
@@ -114,7 +81,6 @@ void ChatSession::Disconnect()
         .lowest_layer()
         .close(ec);
 }
-
 //==================================================
 // ProcessPacket
 //==================================================
