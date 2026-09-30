@@ -82,14 +82,28 @@ wss.on("connection", (ws) => {
     //=======================================================
     // Browser -> Gateway
     //=======================================================
-
     ws.on("message", (data) => {
-        console.log(
-            "[Gateway] Browser message:",
-            data.toString()
-        );
+        try {
+            const message = JSON.parse(data.toString());
+        
+            console.log("[Gateway] Browser message:", message);
+        
+            switch (message.type) {
+                case "login":
+                    sendLogin(message.username, message.password);
+                    break;
+            
+                default:
+                    console.log(`[Gateway] Unknown browser message: ${message.type}`);
+                    break;
+            }
+        } catch (err) {
+            console.error("[Gateway] Invalid browser message:", err.message);
+        }
     });
-
+    
+    
+    
 
     //=======================================================
     // Browser 연결 종료
