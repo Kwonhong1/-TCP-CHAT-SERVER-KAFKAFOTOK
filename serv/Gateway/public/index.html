@@ -1,0 +1,52 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <title>Chat Server Test</title>
+</head>
+<body>
+    <h1>Chat Login Test</h1>
+
+    <input id="username" type="text" placeholder="Username">
+    <input id="password" type="password" placeholder="Password">
+    <button id="loginButton">Login</button>
+
+    <hr>
+    <pre id="result"></pre>
+
+    <script>
+        const result = document.getElementById("result");
+        const socket = new WebSocket("ws://localhost:8081");
+
+        socket.addEventListener("open", () => {
+            result.textContent += "Gateway connected\n";
+        });
+
+        socket.addEventListener("message", (event) => {
+            console.log("Gateway message:", event.data);
+
+            const message = JSON.parse(event.data);
+            result.textContent += JSON.stringify(message, null, 2) + "\n";
+        });
+
+        socket.addEventListener("close", () => {
+            result.textContent += "Gateway disconnected\n";
+        });
+
+        socket.addEventListener("error", () => {
+            result.textContent += "WebSocket error\n";
+        });
+
+        document.getElementById("loginButton").addEventListener("click", () => {
+            const username = document.getElementById("username").value;
+            const password = document.getElementById("password").value;
+
+            socket.send(JSON.stringify({
+                type: "login",
+                username,
+                password
+            }));
+        });
+    </script>
+</body>
+</html>
