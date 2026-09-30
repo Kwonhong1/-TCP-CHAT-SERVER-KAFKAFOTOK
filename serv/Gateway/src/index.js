@@ -12,7 +12,8 @@ const WS_PORT = 8081;
 const HEADER_SIZE = 12;
 const MAX_PACKET_SIZE = 20 * 1024;
 
-const root = await protobuf.load("../chat_protocol.proto");
+const PROTO_PATH = path.join(__dirname, "..", "..", "chat_protocol.proto");
+const root = await protobuf.load(PROTO_PATH);
 
 const LoginRequest = root.lookupType("chat.LoginRequest");
 const LoginResponse = root.lookupType("chat.LoginResponse");
