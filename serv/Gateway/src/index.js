@@ -85,14 +85,14 @@ wss.on("connection", (ws) => {
     ws.on("message", (data) => {
         try {
             const message = JSON.parse(data.toString());
-        
+
             console.log("[Gateway] Browser message:", message);
-        
+
             switch (message.type) {
                 case "login":
                     sendLogin(message.username, message.password);
                     break;
-            
+
                 default:
                     console.log(`[Gateway] Unknown browser message: ${message.type}`);
                     break;
@@ -282,11 +282,7 @@ wss.on("connection", (ws) => {
     // Login request
     //=======================================================
 
-    function sendLogin(
-        username,
-        password,
-        reconnectToken = ""
-    ) {
+    function sendLogin(username, password, reconnectToken = "") {
         const message =
             LoginRequest.create({
                 username,
@@ -325,35 +321,23 @@ wss.on("connection", (ws) => {
 
     function handleLoginResponse(payload) {
         try {
-            const response =
-                LoginResponse.decode(payload);
+            const response = LoginResponse.decode(payload);
 
+            console.log("[Gateway] LOGIN_RESPONSE");
+            console.log(`  success        : ${response.success}`);
+            console.log(`  assignedUserId : ${response.assignedUserId}`);
+            console.log(`  reconnectToken : ${response.reconnectToken}`);
+            console.log(`  errorMessage   : ${response.errorMessage}`);
 
-            console.log(
-                "[Gateway] LOGIN_RESPONSE"
-            );
-
-            console.log(
-                `  success        : ${response.success}`
-            );
-
-            console.log(
-                `  assignedUserId : ${response.assignedUserId}`
-            );
-
-            console.log(
-                `  reconnectToken : ${response.reconnectToken}`
-            );
-
-            console.log(
-                `  errorMessage   : ${response.errorMessage}`
-            );
-
+            ws.send(JSON.stringify({
+                type: "login_response",
+                success: response.success,
+                userId: response.assignedUserId,
+                reconnectToken: response.reconnectToken,
+                errorMessage: response.errorMessage
+            }));
         } catch (err) {
-            console.error(
-                "[Gateway] Failed to decode LoginResponse:",
-                err.message
-            );
+            console.error("[Gateway] Failed to decode LoginResponse:", err.message);
         }
     }
 });
