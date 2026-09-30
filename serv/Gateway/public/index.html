@@ -2,51 +2,142 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <title>Chat Server Test</title>
-</head>
-<body>
-    <h1>Chat Login Test</h1>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
 
-    <input id="username" type="text" placeholder="Username">
-    <input id="password" type="password" placeholder="Password">
-    <button id="loginButton">Login</button>
+    <title>Chat Gateway Test</title>
+</head>
+
+<body>
+
+    <h1>Chat Login Test</h1>
+    <h2>Gateway Test V2</h2>
+
+    <div>
+        <input
+            id="username"
+            type="text"
+            placeholder="Username"
+        >
+
+        <input
+            id="password"
+            type="password"
+            placeholder="Password"
+        >
+
+        <button id="loginButton">
+            Login
+        </button>
+    </div>
 
     <hr>
+
+    <h3>Gateway Status</h3>
     <pre id="result"></pre>
+
 
     <script>
         const result = document.getElementById("result");
-        const socket = new WebSocket("ws://localhost:8081");
+        const loginButton = document.getElementById("loginButton");
+
+        const wsProtocol =
+            location.protocol === "https:" ? "wss:" : "ws:";
+
+        const wsUrl =
+            `${wsProtocol}//${location.host}`;
+
+
+        //=======================================================
+        // Debug Information
+        //=======================================================
+
+        result.textContent += `PAGE URL: ${location.href}\n`;
+        result.textContent += `HOST: ${location.host}\n`;
+        result.textContent += `PROTOCOL: ${location.protocol}\n`;
+        result.textContent += `WS URL: ${wsUrl}\n`;
+        result.textContent += `WebSocket supported: ${"WebSocket" in window}\n`;
+        result.textContent += "Connecting...\n\n";
+
+
+        //=======================================================
+        // WebSocket Connection
+        //=======================================================
+
+        const socket = new WebSocket(wsUrl);
+
 
         socket.addEventListener("open", () => {
             result.textContent += "Gateway connected\n";
+            result.textContent += `readyState: ${socket.readyState}\n\n`;
         });
+
 
         socket.addEventListener("message", (event) => {
-            console.log("Gateway message:", event.data);
+            result.textContent += `MESSAGE: ${event.data}\n`;
 
-            const message = JSON.parse(event.data);
-            result.textContent += JSON.stringify(message, null, 2) + "\n";
+            try {
+                const message = JSON.parse(event.data);
+
+                if (message.type === "login_response") {
+                    result.textContent += "\nLOGIN RESPONSE\n";
+                    result.textContent += `success: ${message.success}\n`;
+                    result.textContent += `userId: ${message.userId}\n`;
+                    result.textContent += `reconnectToken: ${message.reconnectToken}\n`;
+                    result.textContent += `errorMessage: ${message.errorMessage}\n\n`;
+                }
+            } catch (err) {
+                result.textContent += `JSON parse error: ${err.message}\n`;
+            }
         });
 
-        socket.addEventListener("close", () => {
-            result.textContent += "Gateway disconnected\n";
-        });
 
         socket.addEventListener("error", () => {
-            result.textContent += "WebSocket error\n";
+            result.textContent += "\nWebSocket error\n";
+            result.textContent += `readyState: ${socket.readyState}\n`;
         });
 
-        document.getElementById("loginButton").addEventListener("click", () => {
-            const username = document.getElementById("username").value;
-            const password = document.getElementById("password").value;
 
-            socket.send(JSON.stringify({
+        socket.addEventListener("close", (event) => {
+            result.textContent += "\nGateway disconnected\n";
+            result.textContent += `close code: ${event.code}\n`;
+            result.textContent += `close reason: ${event.reason || "(none)"}\n`;
+            result.textContent += `clean: ${event.wasClean}\n`;
+            result.textContent += `readyState: ${socket.readyState}\n`;
+        });
+
+
+        //=======================================================
+        // Login
+        //=======================================================
+
+        loginButton.addEventListener("click", () => {
+            const username =
+                document.getElementById("username").value;
+
+            const password =
+                document.getElementById("password").value;
+
+
+            if (socket.readyState !== WebSocket.OPEN) {
+                result.textContent += "\nCannot login: Gateway is not connected\n";
+                return;
+            }
+
+
+            const message = {
                 type: "login",
                 username,
                 password
-            }));
+            };
+
+
+            result.textContent += `\nSending login request: ${username}\n`;
+
+            socket.send(
+                JSON.stringify(message)
+            );
         });
     </script>
+
 </body>
 </html>
