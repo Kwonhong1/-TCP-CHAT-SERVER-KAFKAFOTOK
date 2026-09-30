@@ -8,7 +8,6 @@ import { WebSocketServer } from "ws";
 
 const SERVER_HOST = "127.0.0.1";
 const SERVER_PORT = 8080;
-const WS_PORT = 8081;
 const WEB_PORT = 8082;
 
 const HEADER_SIZE = 12;
@@ -17,41 +16,31 @@ const MAX_PACKET_SIZE = 20 * 1024;
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
-const root = await protobuf.load("../chat_protocol.proto");
+const PROTO_PATH = path.join(__dirname, "..", "..", "chat_protocol.proto");
+const INDEX_PATH = path.join(__dirname, "..", "public", "index.html");
+
+const root = await protobuf.load(PROTO_PATH);
 
 const LoginRequest = root.lookupType("chat.LoginRequest");
 const LoginResponse = root.lookupType("chat.LoginResponse");
 
 
 //=======================================================
-// Test Web Server
+// HTTP Server
 //=======================================================
 
 const httpServer = http.createServer((req, res) => {
-    const filePath = path.join(__dirname, "..", "public", "index.html");
-
-    fs.readFile(filePath, (err, data) => {
+    fs.readFile(INDEX_PATH, (err, data) => {
         if (err) {
             console.error("[Gateway] Failed to read index.html:", err.message);
-
-            res.writeHead(500, {
-                "Content-Type": "text/plain; charset=utf-8"
-            });
-
+            res.writeHead(500, { "Content-Type": "text/plain; charset=utf-8" });
             res.end("Internal Server Error");
             return;
         }
 
-        res.writeHead(200, {
-            "Content-Type": "text/html; charset=utf-8"
-        });
-
+        res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
         res.end(data);
     });
-});
-
-httpServer.listen(WEB_PORT, () => {
-    console.log(`[Gateway] Test web server listening on port ${WEB_PORT}`);
 });
 
 
@@ -60,15 +49,16 @@ httpServer.listen(WEB_PORT, () => {
 //=======================================================
 
 const wss = new WebSocketServer({
-    port: WS_PORT
+    server: httpServer
 });
 
-wss.on("listening", () => {
-    console.log(`[Gateway] WebSocket server listening on port ${WS_PORT}`);
+httpServer.listen(WEB_PORT, () => {
+    console.log(`[Gateway] HTTP/WebSocket server listening on port ${WEB_PORT}`);
 });
 
 wss.on("connection", (ws) => {
     console.log("[Gateway] Browser connected");
+
 
     //=======================================================
     // 이 브라우저 전용 C++ TLS 연결
@@ -240,13 +230,7 @@ wss.on("connection", (ws) => {
         });
 
         const payload = LoginRequest.encode(message).finish();
-
-        const packet = makePacket(
-            1001,
-            0,
-            1,
-            Buffer.from(payload)
-        );
+        const packet = makePacket(1001, 0, 1, Buffer.from(payload));
 
         console.log(`[Gateway] Sending LOGIN_REQUEST: ${packet.length} bytes`);
 
