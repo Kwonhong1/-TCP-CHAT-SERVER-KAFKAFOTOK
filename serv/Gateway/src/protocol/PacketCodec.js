@@ -1,6 +1,11 @@
 export const HEADER_SIZE = 12;
 export const MAX_PACKET_SIZE = 20 * 1024;
 
+
+//=======================================================
+// Serialize
+//=======================================================
+
 export function serialize(
     messageType,
     userId,
@@ -15,10 +20,7 @@ export function serialize(
     }
 
     const message = protoType.create(value);
-
-    const payload = Buffer.from(
-        protoType.encode(message).finish()
-    );
+    const payload = Buffer.from(protoType.encode(message).finish());
 
     return makePacket(
         messageType,
@@ -27,6 +29,11 @@ export function serialize(
         payload
     );
 }
+
+
+//=======================================================
+// Packet Encode
+//=======================================================
 
 function makePacket(
     messageType,
@@ -37,9 +44,7 @@ function makePacket(
     const packetSize = HEADER_SIZE + payload.length;
 
     if (packetSize > MAX_PACKET_SIZE) {
-        throw new Error(
-            `Packet too large: ${packetSize}`
-        );
+        throw new Error(`Packet too large: ${packetSize}`);
     }
 
     const packet = Buffer.alloc(packetSize);
@@ -54,11 +59,61 @@ function makePacket(
     return packet;
 }
 
-//proto용
-export function protoToObject(
-    protoType,
-    message
-) {
+
+//=======================================================
+// Packet Decode
+//=======================================================
+
+export function getPacketSize(buffer) {
+    if (buffer.length < HEADER_SIZE) {
+        throw new Error("Packet header is incomplete");
+    }
+
+    return buffer.readUInt16LE(0);
+}
+
+export function decodePacket(packet) {
+    if (packet.length < HEADER_SIZE) {
+        throw new Error("Packet is too small");
+    }
+
+    const packetSize = packet.readUInt16LE(0);
+
+    if (packetSize !== packet.length) {
+        throw new Error(
+            `Packet size mismatch: header=${packetSize}, actual=${packet.length}`
+        );
+    }
+
+    if (packetSize > MAX_PACKET_SIZE) {
+        throw new Error(`Packet too large: ${packetSize}`);
+    }
+
+    const header = {
+        packetSize,
+        messageType: packet.readUInt16LE(2),
+        userId: packet.readUInt32LE(4),
+        sequenceNumber: packet.readUInt32LE(8)
+    };
+
+    const payload = packet.subarray(HEADER_SIZE);
+
+    return {
+        header,
+        payload
+    };
+}
+
+
+//=======================================================
+// Protobuf Decode
+//=======================================================
+
+export function decodeProto(protoType, payload) {
+    return protoType.decode(payload);
+}
+
+export function protoToObject(protoType, message) {
     return protoType.toObject(message, {
         longs: String,
         enums: String,

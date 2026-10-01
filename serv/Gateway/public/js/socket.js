@@ -3,17 +3,16 @@ let socket = null;
 const handlers = new Map();
 
 export function connect() {
-    const protocol =
-        location.protocol === "https:"
-            ? "wss:"
-            : "ws:";
+    const protocol = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = `${protocol}//${location.host}/ws`;
 
-    const url =
-        `${protocol}//${location.hostname}:ws`;
+    console.log("Connecting WebSocket:", url);
 
     socket = new WebSocket(url);
 
     socket.addEventListener("open", () => {
+        console.log("WebSocket connected");
+
         dispatch({
             type: "gateway_connected"
         });
@@ -25,20 +24,21 @@ export function connect() {
             dispatch(message);
         }
         catch (err) {
-            console.error(
-                "Invalid Gateway message:",
-                err
-            );
+            console.error("Invalid Gateway message:", err);
         }
     });
 
     socket.addEventListener("close", () => {
+        console.log("WebSocket disconnected");
+
         dispatch({
             type: "gateway_disconnected"
         });
     });
 
-    socket.addEventListener("error", () => {
+    socket.addEventListener("error", (event) => {
+        console.error("WebSocket error:", event);
+
         dispatch({
             type: "gateway_error",
             errorMessage: "WebSocket error"
@@ -47,16 +47,11 @@ export function connect() {
 }
 
 export function send(message) {
-    if (
-        !socket ||
-        socket.readyState !== WebSocket.OPEN
-    ) {
+    if (!socket || socket.readyState !== WebSocket.OPEN) {
         throw new Error("Gateway is not connected");
     }
 
-    socket.send(
-        JSON.stringify(message)
-    );
+    socket.send(JSON.stringify(message));
 }
 
 export function on(type, handler) {
@@ -71,11 +66,7 @@ function dispatch(message) {
     const list = handlers.get(message.type);
 
     if (!list) {
-        console.log(
-            "Unhandled Gateway message:",
-            message
-        );
-
+        console.log("Unhandled Gateway message:", message);
         return;
     }
 
