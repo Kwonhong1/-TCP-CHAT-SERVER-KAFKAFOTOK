@@ -195,7 +195,7 @@ void ChatSession::Start()
                             );
 
                     self->StartIdleTimer();
-                    auto write_self=shared_form_this();
+                    auto write_self=shared_from_this();
                     co_spawn(self->strand_,
                     [self]() -> awaitable<void>
                     {
