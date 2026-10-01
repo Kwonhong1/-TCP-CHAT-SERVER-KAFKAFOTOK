@@ -13,8 +13,7 @@ export class MessageDispatcher {
     }
 
     async dispatchBrowser(connection, message) {
-        const handler =
-            this.browserHandlers.get(message.type);
+        const handler = this.browserHandlers.get(message.type);
 
         if (!handler) {
             throw new Error(
@@ -25,18 +24,14 @@ export class MessageDispatcher {
         await handler(connection, message);
     }
 
-    async dispatchServer(
-        connection,
-        messageType,
-        payload,
-        header
-    ) {
-        const handler =
-            this.serverHandlers.get(messageType);
+    async dispatchServer(connection, header, payload) {
+        const handler = this.serverHandlers.get(
+            header.messageType
+        );
 
         if (!handler) {
             console.log(
-                `[Gateway] Unhandled server message: ${messageType}`
+                `[Gateway] Unhandled server message: ${header.messageType}`
             );
             return;
         }
