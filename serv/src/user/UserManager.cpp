@@ -130,4 +130,4 @@ UserManager::SetUserOfflineAsync(
     co_await user->SetOnlineAsync(
         false
     );
-}8
+}
