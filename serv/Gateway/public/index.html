@@ -2,142 +2,262 @@
 <html lang="ko">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta
+        name="viewport"
+        content="width=device-width, initial-scale=1.0"
+    >
 
-    <title>Chat Gateway Test</title>
+    <title>Chat Server</title>
+
+    <link rel="stylesheet" href="/css/style.css">
 </head>
 
 <body>
 
-    <h1>Chat Login Test</h1>
-    <h2>Gateway Test V2</h2>
+<div id="app">
 
-    <div>
-        <input
-            id="username"
-            type="text"
-            placeholder="Username"
-        >
+    <!-- ============================================= -->
+    <!-- Connection Status -->
+    <!-- ============================================= -->
 
-        <input
-            id="password"
-            type="password"
-            placeholder="Password"
-        >
+    <header class="top-bar">
+        <h1>Chat Server</h1>
 
-        <button id="loginButton">
-            Login
-        </button>
-    </div>
-
-    <hr>
-
-    <h3>Gateway Status</h3>
-    <pre id="result"></pre>
+        <div id="connection-status" class="status disconnected">
+            Gateway 연결 중...
+        </div>
+    </header>
 
 
-    <script>
-        const result = document.getElementById("result");
-        const loginButton = document.getElementById("loginButton");
+    <!-- ============================================= -->
+    <!-- Auth -->
+    <!-- ============================================= -->
 
-        const wsProtocol =
-            location.protocol === "https:" ? "wss:" : "ws:";
+    <main id="auth-view" class="view active">
+        <section class="panel auth-panel">
 
-        const wsUrl =
-            `${wsProtocol}//${location.host}`;
+            <h2>로그인</h2>
 
+            <input
+                id="login-username"
+                type="text"
+                placeholder="Username"
+            >
 
-        //=======================================================
-        // Debug Information
-        //=======================================================
+            <input
+                id="login-password"
+                type="password"
+                placeholder="Password"
+            >
 
-        result.textContent += `PAGE URL: ${location.href}\n`;
-        result.textContent += `HOST: ${location.host}\n`;
-        result.textContent += `PROTOCOL: ${location.protocol}\n`;
-        result.textContent += `WS URL: ${wsUrl}\n`;
-        result.textContent += `WebSocket supported: ${"WebSocket" in window}\n`;
-        result.textContent += "Connecting...\n\n";
+            <button id="login-button">
+                로그인
+            </button>
 
+            <hr>
 
-        //=======================================================
-        // WebSocket Connection
-        //=======================================================
+            <h2>회원가입</h2>
 
-        const socket = new WebSocket(wsUrl);
+            <input
+                id="register-username"
+                type="text"
+                placeholder="Username"
+            >
 
+            <input
+                id="register-password"
+                type="password"
+                placeholder="Password"
+            >
 
-        socket.addEventListener("open", () => {
-            result.textContent += "Gateway connected\n";
-            result.textContent += `readyState: ${socket.readyState}\n\n`;
-        });
+            <button id="register-button">
+                회원가입
+            </button>
 
+            <p id="auth-message"></p>
 
-        socket.addEventListener("message", (event) => {
-            result.textContent += `MESSAGE: ${event.data}\n`;
-
-            try {
-                const message = JSON.parse(event.data);
-
-                if (message.type === "login_response") {
-                    result.textContent += "\nLOGIN RESPONSE\n";
-                    result.textContent += `success: ${message.success}\n`;
-                    result.textContent += `userId: ${message.userId}\n`;
-                    result.textContent += `reconnectToken: ${message.reconnectToken}\n`;
-                    result.textContent += `errorMessage: ${message.errorMessage}\n\n`;
-                }
-            } catch (err) {
-                result.textContent += `JSON parse error: ${err.message}\n`;
-            }
-        });
+        </section>
+    </main>
 
 
-        socket.addEventListener("error", () => {
-            result.textContent += "\nWebSocket error\n";
-            result.textContent += `readyState: ${socket.readyState}\n`;
-        });
+    <!-- ============================================= -->
+    <!-- Lobby -->
+    <!-- ============================================= -->
+
+    <main id="lobby-view" class="view">
+
+        <section class="panel lobby-panel">
+
+            <div class="panel-header">
+                <div>
+                    <h2>방 목록</h2>
+                    <span id="user-info"></span>
+                </div>
+
+                <button id="refresh-rooms-button">
+                    새로고침
+                </button>
+            </div>
+
+            <div id="room-list"></div>
+
+        </section>
 
 
-        socket.addEventListener("close", (event) => {
-            result.textContent += "\nGateway disconnected\n";
-            result.textContent += `close code: ${event.code}\n`;
-            result.textContent += `close reason: ${event.reason || "(none)"}\n`;
-            result.textContent += `clean: ${event.wasClean}\n`;
-            result.textContent += `readyState: ${socket.readyState}\n`;
-        });
+        <section class="panel create-room-panel">
+
+            <h2>방 만들기</h2>
+
+            <input
+                id="room-name"
+                type="text"
+                placeholder="방 이름"
+            >
+
+            <input
+                id="room-max-users"
+                type="number"
+                value="10"
+                min="2"
+            >
+
+            <button id="create-room-button">
+                방 생성
+            </button>
+
+            <p id="lobby-message"></p>
+
+        </section>
+
+    </main>
 
 
-        //=======================================================
-        // Login
-        //=======================================================
+    <!-- ============================================= -->
+    <!-- Chat Room -->
+    <!-- ============================================= -->
 
-        loginButton.addEventListener("click", () => {
-            const username =
-                document.getElementById("username").value;
+    <main id="chat-view" class="view">
 
-            const password =
-                document.getElementById("password").value;
+        <section class="panel chat-panel">
 
+            <div class="chat-header">
+                <div>
+                    <h2 id="chat-room-title">
+                        Chat Room
+                    </h2>
 
-            if (socket.readyState !== WebSocket.OPEN) {
-                result.textContent += "\nCannot login: Gateway is not connected\n";
-                return;
-            }
+                    <span id="room-info"></span>
+                </div>
 
-
-            const message = {
-                type: "login",
-                username,
-                password
-            };
+                <button id="leave-room-button">
+                    방 나가기
+                </button>
+            </div>
 
 
-            result.textContent += `\nSending login request: ${username}\n`;
+            <button
+                id="load-history-button"
+                class="secondary-button"
+            >
+                이전 메시지 불러오기
+            </button>
 
-            socket.send(
-                JSON.stringify(message)
-            );
-        });
-    </script>
+
+            <div id="chat-messages"></div>
+
+
+            <div class="chat-input">
+
+                <input
+                    id="chat-message-input"
+                    type="text"
+                    placeholder="메시지를 입력하세요"
+                >
+
+                <button id="send-chat-button">
+                    전송
+                </button>
+
+            </div>
+
+        </section>
+
+
+        <!-- ========================================= -->
+        <!-- Whisper -->
+        <!-- ========================================= -->
+
+        <aside class="side-panel">
+
+            <section class="panel">
+
+                <h3>귓속말</h3>
+
+                <input
+                    id="whisper-target"
+                    type="text"
+                    placeholder="상대 Username"
+                >
+
+                <input
+                    id="whisper-message"
+                    type="text"
+                    placeholder="메시지"
+                >
+
+                <button id="whisper-button">
+                    보내기
+                </button>
+
+            </section>
+
+
+            <!-- ===================================== -->
+            <!-- Admin -->
+            <!-- ===================================== -->
+
+            <section class="panel">
+
+                <h3>방 관리</h3>
+
+                <input
+                    id="kick-user-id"
+                    type="number"
+                    placeholder="강퇴할 User ID"
+                >
+
+                <button id="kick-user-button">
+                    강퇴
+                </button>
+
+                <input
+                    id="master-user-id"
+                    type="number"
+                    placeholder="새 방장 User ID"
+                >
+
+                <button id="transfer-master-button">
+                    방장 위임
+                </button>
+
+            </section>
+
+
+            <section class="panel">
+
+                <h3>알림</h3>
+
+                <div id="notifications"></div>
+
+            </section>
+
+        </aside>
+
+    </main>
+
+</div>
+
+<script type="module" src="/js/app.js"></script>
 
 </body>
 </html>

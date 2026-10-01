@@ -20,20 +20,16 @@ class ChatSession :
 {
     public:
     
-        ChatSession(
-            tcp::socket socket,
-            ssl::context& ssl_ctx,
-            ChatServer& server);
+    ChatSession(tcp::socket socket, ssl::context& ssl_ctx, ChatServer& server);
+
     ~ChatSession();
-    boost::asio::strand<
-            boost::asio::any_io_executor
-        >& GetStrand();
+    boost::asio::strand<boost::asio::any_io_executor>& GetStrand();
     void Start();
     //--------------------------------------------------
         // session strand 내부에서 사용하는 빠른 API
         //--------------------------------------------------
     
-        uint32_t GetUserId() const;
+    uint32_t GetUserId() const;
     uint32_t GetRoomId() const;
     bool IsAuthenticated() const;
     void SetUserId(uint32_t id);
