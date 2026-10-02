@@ -7,204 +7,121 @@
 
 void ChatServer::InitHandlers()
 {
-    dispatcher_.RegisterHandler<
-        chat::LoginRequest
-    >(
+    dispatcher_.RegisterHandler<chat::LoginRequest>(
         MessageType::LOGIN_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::PUBLIC,
+        [this](auto s, const auto& req)
         {
-            return AuthHandler::HandleLogin(
-                *this,
-                s,
-                req
-            );
+            return AuthHandler::HandleLogin(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::RegisterRequest
-    >(
+    dispatcher_.RegisterHandler<chat::RegisterRequest>(
         MessageType::REGISTER_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::PUBLIC,
+        [this](auto s, const auto& req)
         {
-            return AuthHandler::HandleRegister(
-                *this,
-                s,
-                req
-            );
+            return AuthHandler::HandleRegister(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::CreateRoomRequest
-    >(
+    dispatcher_.RegisterHandler<chat::CreateRoomRequest>(
         MessageType::CREATE_ROOM_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return RoomHandler::HandleCreateRoom(
-                *this,
-                s,
-                req
-            );
+            return RoomHandler::HandleCreateRoom(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::RoomListRequest
-    >(
+    dispatcher_.RegisterHandler<chat::RoomListRequest>(
         MessageType::ROOM_LIST_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return RoomHandler::HandleRoomList(
-                *this,
-                s,
-                req
-            );
+            return RoomHandler::HandleRoomList(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::JoinRoomRequest
-    >(
+    dispatcher_.RegisterHandler<chat::JoinRoomRequest>(
         MessageType::JOIN_ROOM,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return RoomHandler::HandleJoinRoom(
-                *this,
-                s,
-                req
-            );
+            return RoomHandler::HandleJoinRoom(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::LeaveRoomRequest
-    >(
+    dispatcher_.RegisterHandler<chat::LeaveRoomRequest>(
         MessageType::LEAVE_ROOM,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return RoomHandler::HandleLeaveRoom(
-                *this,
-                s,
-                req
-            );
+            return RoomHandler::HandleLeaveRoom(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::ChatMessage
-    >(
+    dispatcher_.RegisterHandler<chat::ChatMessage>(
         MessageType::CHAT_MESSAGE,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return ChatHandler::HandleChatMessage(
-                *this,
-                s,
-                req
-            );
+            return ChatHandler::HandleChatMessage(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::ChatHistoryRequest
-    >(
+    dispatcher_.RegisterHandler<chat::ChatHistoryRequest>(
         MessageType::CHAT_HISTORY_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return ChatHandler::HandleChatHistory(
-                *this,
-                s,
-                req
-            );
+            return ChatHandler::HandleChatHistory(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::WhisperRequest
-    >(
+    dispatcher_.RegisterHandler<chat::WhisperRequest>(
         MessageType::WHISPER_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return ChatHandler::HandleWhisper(
-                *this,
-                s,
-                req
-            );
+            return ChatHandler::HandleWhisper(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::KickUserRequest
-    >(
+    dispatcher_.RegisterHandler<chat::KickUserRequest>(
         MessageType::KICK_USER_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return AdminHandler::HandleKickUser(
-                *this,
-                s,
-                req
-            );
+            return AdminHandler::HandleKickUser(*this, s, req);
         }
     );
 
-    dispatcher_.RegisterHandler<
-        chat::TransferMasterRequest
-    >(
+    dispatcher_.RegisterHandler<chat::TransferMasterRequest>(
         MessageType::TRANSFER_MASTER_REQUEST,
-
-        [this](
-            auto s,
-            const auto& req)
+        AuthPolicy::AUTHENTICATED,
+        [this](auto s, const auto& req)
         {
-            return AdminHandler::HandleTransferMaster(
-                *this,
-                s,
-                req
-            );
+            return AdminHandler::HandleTransferMaster(*this, s, req);
         }
     );
 
     dispatcher_.RegisterRawHandler(
         MessageType::PING,
-
+        AuthPolicy::PUBLIC,
         [](auto s)
         {
-            return SystemHandler::HandlePing(
-                s
-            );
+            return SystemHandler::HandlePing(s);
         }
     );
 }
+
+
+
+
+
+
+
 
 
 // Implementations moved out of the header during refactor v2.

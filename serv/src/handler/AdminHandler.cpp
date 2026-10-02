@@ -11,10 +11,7 @@
 awaitable<void> AdminHandler::HandleKickUser(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::KickUserRequest& req)
     {
         chat::KickUserResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::KICK_USER_RESPONSE, res); co_return;
-        }
+
         if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("NOT_IN_ROOM");
             session->Send(MessageType::KICK_USER_RESPONSE, res); co_return;
@@ -29,10 +26,7 @@ awaitable<void> AdminHandler::HandleKickUser(ChatServer& server, std::shared_ptr
 awaitable<void> AdminHandler::HandleTransferMaster(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::TransferMasterRequest& req)
     {
         chat::TransferMasterResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::TRANSFER_MASTER_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("NOT_IN_ROOM");
             session->Send(MessageType::TRANSFER_MASTER_RESPONSE, res); co_return;

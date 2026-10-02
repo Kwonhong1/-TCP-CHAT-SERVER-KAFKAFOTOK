@@ -11,10 +11,7 @@
 awaitable<void> RoomHandler::HandleCreateRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::CreateRoomRequest& req)
     {
         chat::CreateRoomResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::CREATE_ROOM_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() != 0) {
             res.set_success(false); res.set_error_message("ALREADY_IN_ROOM");
             session->Send(MessageType::CREATE_ROOM_RESPONSE, res); co_return;
@@ -39,12 +36,6 @@ awaitable<void> RoomHandler::HandleRoomList(
         std::shared_ptr<ChatSession> session,
         const chat::RoomListRequest&)
     {
-        if (
-            !session->IsAuthenticated()
-        )
-        {
-            co_return;
-        }
 
         auto rooms =
             co_await
@@ -72,10 +63,7 @@ awaitable<void> RoomHandler::HandleRoomList(
 awaitable<void> RoomHandler::HandleJoinRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::JoinRoomRequest& req)
     {
         chat::JoinRoomResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::JOIN_ROOM_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() != 0) {
             res.set_success(false); res.set_error_message("ALREADY_IN_ROOM");
             session->Send(MessageType::JOIN_ROOM_RESPONSE, res); co_return;
@@ -112,10 +100,7 @@ awaitable<void> RoomHandler::HandleJoinRoom(ChatServer& server, std::shared_ptr<
 awaitable<void> RoomHandler::HandleLeaveRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::LeaveRoomRequest& req)
     {
         chat::LeaveRoomResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("INVALID_ROOM");
             session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;

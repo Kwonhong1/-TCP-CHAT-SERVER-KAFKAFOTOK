@@ -10,7 +10,6 @@
 
 awaitable<void> ChatHandler::HandleChatMessage(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::ChatMessage& msg_param)
     {
-        if (!session->IsAuthenticated()) co_return;
         uint32_t user_id = session->GetUserId();
         chat::ChatMessage msg = msg_param;
         if (session->GetRoomId() == 0 || session->GetRoomId() != msg.room_id()) co_return;
@@ -34,10 +33,7 @@ awaitable<void> ChatHandler::HandleChatHistory(ChatServer& server, std::shared_p
     {
         chat::ChatHistoryResponse res;
         res.set_room_id(req.room_id());
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("NOT_IN_ROOM");
             session->Send(MessageType::CHAT_HISTORY_RESPONSE, res); co_return;
@@ -74,10 +70,7 @@ awaitable<void> ChatHandler::HandleChatHistory(ChatServer& server, std::shared_p
 awaitable<void> ChatHandler::HandleWhisper(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::WhisperRequest& req)
     {
         chat::WhisperResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
-        }
+        
         if (req.room_id() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("INVALID_ROOM");
             session->Send(MessageType::WHISPER_RESPONSE, res); co_return;
