@@ -4,6 +4,7 @@
 #include "room/ChatRoom.hpp"
 #include "user/User.hpp"
 #include "protocol/Protocol.hpp"
+#include "protocol/ChatMessageMapper.hpp"
 #include <chrono>
 #include <iostream>
 #include <string>
@@ -56,12 +57,12 @@ awaitable<void> ChatHandler::HandleChatHistory(ChatServer& server, std::shared_p
 
         res.set_success(true); res.set_has_more(result.has_more);
         for (const auto& db_msg : result.messages) {
-            auto* msg = res.add_messages();
-            msg->set_message_id(db_msg.message_id()); msg->set_room_id(db_msg.room_id());
-            msg->set_sender_id(db_msg.sender_id()); msg->set_sender_username(db_msg.sender_name());
-            msg->set_message(db_msg.message()); msg->set_timestamp(db_msg.timestamp());
-            if (PACKET_HEADER_SIZE + res.ByteSizeLong() > MAX_PACKET_SIZE) {
-                res.mutable_messages()->RemoveLast(); res.set_has_more(true); break;
+        *res.add_messages() = ChatMessageMapper::ToProto(db_msg);
+
+        if (PACKET_HEADER_SIZE + res.ByteSizeLong() > MAX_PACKET_SIZE) {
+            res.mutable_messages()->RemoveLast();
+            res.set_has_more(true);
+            break;
             }
         }
         session->Send(MessageType::CHAT_HISTORY_RESPONSE, res);
