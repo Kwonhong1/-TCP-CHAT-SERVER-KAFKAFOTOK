@@ -289,6 +289,25 @@ func (s *server) GetChatHistory(ctx context.Context, req *pb.ChatHistoryRequest)
 		Messages: messages,
 	}, nil
 }
+// 8. 채팅 기록 삭제	
+func (s *server) DeleteRoomHistory(ctx context.Context, req *pb.DeleteRoomHistoryRequest) (*pb.DeleteRoomHistoryResponse, error) {
+    _, err := s.db.ExecContext(
+        ctx,
+        "DELETE FROM chat_messages WHERE room_id = ?",
+        req.RoomId,
+    )
+
+    if err != nil {
+        return &pb.DeleteRoomHistoryResponse{
+            Success:      false,
+            ErrorMessage: err.Error(),
+        }, nil
+    }
+
+    return &pb.DeleteRoomHistoryResponse{
+        Success: true,
+    }, nil
+}
 
 // ----------------------------------------------------
 // 메인 진입점

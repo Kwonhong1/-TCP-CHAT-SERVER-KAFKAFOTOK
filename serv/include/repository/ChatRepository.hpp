@@ -16,27 +16,29 @@ public:
     struct ChatHistoryResult
     {
         bool success{false};
-
-        std::vector<
-            chatdb::ChatMessageData
-        > messages;
-
+        std::vector<chatdb::ChatMessageData> messages;
         bool has_more{false};
         std::string error_msg;
     };
-    explicit ChatRepository(
-            std::shared_ptr<grpc::Channel> channel);
+
+    struct DeleteRoomHistoryResult 
+    {
+        bool success = false;
+        std::string error_msg;
+    };
+
+    explicit ChatRepository(std::shared_ptr<grpc::Channel> channel);
+
     awaitable<bool> PublishChatAsync(
             uint32_t room_id,
             uint32_t user_id,
             const std::string& message,
             int64_t timestamp);
-    awaitable<ChatHistoryResult>
-        GetChatHistoryAsync(
+    awaitable<ChatHistoryResult> GetChatHistoryAsync(
             uint32_t room_id,
             uint64_t last_msg_id,
-            uint32_t limit);
-
+            uint32_t limit );
+    awaitable<DeleteRoomHistoryResult> DeleteRoomHistoryAsync(uint32_t room_id);
 private:
 
     std::unique_ptr<

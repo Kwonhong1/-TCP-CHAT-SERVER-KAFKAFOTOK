@@ -31,25 +31,18 @@ awaitable<bool> ChatRepository::PublishChatAsync(
              timestamp,
              executor](auto handler) mutable
             {
-                auto context =
-                    std::make_shared<
-                        grpc::ClientContext>();
+                auto context =std::make_shared<grpc::ClientContext>();
 
-                auto req =
-                    std::make_shared<
-                        chatdb::ChatPublishRequest>();
+                auto req =std::make_shared<chatdb::ChatPublishRequest>();
 
                 req->set_room_id(room_id);
                 req->set_user_id(user_id);
                 req->set_message(message);
                 req->set_timestamp(timestamp);
 
-                auto res =
-                    std::make_shared<
-                        chatdb::ChatPublishResponse>();
+                auto res =std::make_shared<chatdb::ChatPublishResponse>();
 
-                using Handler =
-                    std::decay_t<decltype(handler)>;
+                using Handler =std::decay_t<decltype(handler)>;
 
                 auto handler_ptr =
                     std::make_shared<Handler>(

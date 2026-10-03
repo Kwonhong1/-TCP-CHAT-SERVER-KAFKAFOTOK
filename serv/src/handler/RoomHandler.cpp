@@ -4,6 +4,8 @@
 #include "room/ChatRoom.hpp"
 #include "user/User.hpp"
 #include "protocol/Protocol.hpp"
+#include "room/RoomLifecycle.hpp"
+
 #include <chrono>
 #include <iostream>
 #include <string>
@@ -112,10 +114,7 @@ awaitable<void> RoomHandler::HandleJoinRoom(ChatServer& server, std::shared_ptr<
 awaitable<void> RoomHandler::HandleLeaveRoom(ChatServer& server, std::shared_ptr<ChatSession> session, const chat::LeaveRoomRequest& req)
     {
         chat::LeaveRoomResponse res;
-        if (!session->IsAuthenticated()) {
-            res.set_success(false); res.set_error_message("NOT_AUTHENTICATED");
-            session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
-        }
+        
         if (session->GetRoomId() == 0 || session->GetRoomId() != req.room_id()) {
             res.set_success(false); res.set_error_message("INVALID_ROOM");
             session->Send(MessageType::LEAVE_ROOM_RESPONSE, res); co_return;
@@ -128,7 +127,9 @@ awaitable<void> RoomHandler::HandleLeaveRoom(ChatServer& server, std::shared_ptr
         }
 
         session->SetRoomId(0);
-        co_await server.GetRoomManager().DestroyRoomIfEmptyAsync(room->GetId(), room);
+
+        co_await RoomLifecycle::CleanupIfEmptyAsync(server, room);
+    
         res.set_success(true);
         session->Send(MessageType::LEAVE_ROOM_RESPONSE, res);
     }
