@@ -10,6 +10,7 @@ User::User(boost::asio::io_context& io_context, uint32_t id, std::string usernam
       username_(std::move(username)),
       is_online_(false),
       room_id_(0),
+      reconnect_generation_(0),
       reconnect_timer_(io_context)
 {
 }
@@ -68,18 +69,21 @@ awaitable<uint32_t> User::GetRoomIdAsync()
     co_return room_id_;
 }
 
-awaitable<void> User::StartReconnectGraceAsync(std::chrono::seconds timeout)
+//--------------------------------------------------
+// reconnect lifecycle
+//--------------------------------------------------
+
+awaitable<uint64_t> User::BeginReconnectGraceAsync(std::chrono::seconds timeout)
 {
     co_await boost::asio::dispatch(strand_, use_awaitable);
+
+    is_online_ = false;
+
+    ++reconnect_generation_;
+
     reconnect_timer_.expires_after(timeout);
-}
 
-awaitable<void> User::CancelReconnectGraceAsync()
-{
-    co_await boost::asio::dispatch(strand_, use_awaitable);
-
-    boost::system::error_code ec;
-    reconnect_timer_.cancel(ec);
+    co_return reconnect_generation_;
 }
 
 awaitable<bool> User::WaitReconnectGraceAsync()
@@ -87,7 +91,10 @@ awaitable<bool> User::WaitReconnectGraceAsync()
     co_await boost::asio::dispatch(strand_, use_awaitable);
 
     boost::system::error_code ec;
-    co_await reconnect_timer_.async_wait(boost::asio::redirect_error(use_awaitable, ec));
+
+    co_await reconnect_timer_.async_wait(
+        boost::asio::redirect_error(use_awaitable, ec)
+    );
 
     if (ec == boost::asio::error::operation_aborted) {
         co_return false;
@@ -96,6 +103,36 @@ awaitable<bool> User::WaitReconnectGraceAsync()
     if (ec) {
         co_return false;
     }
+
+    co_return true;
+}
+
+awaitable<void> User::CompleteReconnectAsync(std::shared_ptr<ChatSession> session)
+{
+    co_await boost::asio::dispatch(strand_, use_awaitable);
+
+    ++reconnect_generation_;
+
+    boost::system::error_code ec;
+    reconnect_timer_.cancel(ec);
+
+    session_ = session;
+    is_online_ = true;
+}
+
+awaitable<bool> User::TryExpireReconnectAsync(uint64_t generation)
+{
+    co_await boost::asio::dispatch(strand_, use_awaitable);
+
+    if (reconnect_generation_ != generation) {
+        co_return false;
+    }
+
+    if (is_online_) {
+        co_return false;
+    }
+
+    ++reconnect_generation_;
 
     co_return true;
 }

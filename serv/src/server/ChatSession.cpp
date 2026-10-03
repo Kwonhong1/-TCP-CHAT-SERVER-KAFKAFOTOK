@@ -8,7 +8,6 @@
 //==================================================
 // Disconnect
 //==================================================
-
 void ChatSession::Disconnect()
 {
     if (is_disconnected_.exchange(true)) {
@@ -34,19 +33,35 @@ void ChatSession::Disconnect()
                     co_return;
                 }
 
-                co_await user->SetOnlineAsync(false);
+                //--------------------------------------------------
+                // no room
+                //--------------------------------------------------
+
+                if (cur_room_id == 0) {
+                    co_await user->SetOnlineAsync(false);
+
+                    co_await server_ptr->GetSessionRepository()->SetUserSessionStateAsync(
+                        cur_user_id,
+                        "OFFLINE"
+                    );
+
+                    co_return;
+                }
+
+                //--------------------------------------------------
+                // reconnect grace
+                //--------------------------------------------------
+
+                co_await user->SetRoomIdAsync(cur_room_id);
+
+                uint64_t generation = co_await user->BeginReconnectGraceAsync(
+                    std::chrono::seconds(30)
+                );
 
                 co_await server_ptr->GetSessionRepository()->SetUserSessionStateAsync(
                     cur_user_id,
                     "OFFLINE"
                 );
-
-                if (cur_room_id == 0) {
-                    co_return;
-                }
-
-                co_await user->SetRoomIdAsync(cur_room_id);
-                co_await user->StartReconnectGraceAsync(std::chrono::seconds(30));
 
                 bool expired = co_await user->WaitReconnectGraceAsync();
 
@@ -54,9 +69,19 @@ void ChatSession::Disconnect()
                     co_return;
                 }
 
-                if (co_await user->IsOnlineAsync()) {
+                //--------------------------------------------------
+                // atomic expiration check
+                //--------------------------------------------------
+
+                bool can_cleanup = co_await user->TryExpireReconnectAsync(generation);
+
+                if (!can_cleanup) {
                     co_return;
                 }
+
+                //--------------------------------------------------
+                // room cleanup
+                //--------------------------------------------------
 
                 auto room = co_await server_ptr->GetRoomManager().GetRoomAsync(cur_room_id);
 
@@ -86,8 +111,8 @@ void ChatSession::Disconnect()
     ssl_socket_.lowest_layer().close(ec);
 }
 
-//==================================================
-// ProcessPacket
+
+
 //==================================================
 
 awaitable<void> ChatSession::ProcessPacketAsync(const char* data, size_t size)

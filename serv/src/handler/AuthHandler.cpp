@@ -29,19 +29,12 @@ awaitable<void> AuthHandler::HandleLogin(ChatServer& server, std::shared_ptr<Cha
             );
 
             //--------------------------------------------------
-            // reconnect grace cancel
+            // complete reconnect atomically
             //--------------------------------------------------
 
-            co_await user->CancelReconnectGraceAsync();
+            co_await user->CompleteReconnectAsync(session);
 
             uint32_t room_id = co_await user->GetRoomIdAsync();
-
-            //--------------------------------------------------
-            // restore user
-            //--------------------------------------------------
-
-            co_await user->SetSessionAsync(session);
-            co_await user->SetOnlineAsync(true);
 
             //--------------------------------------------------
             // restore session

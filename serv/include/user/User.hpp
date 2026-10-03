@@ -27,10 +27,10 @@ public:
     awaitable<void> SetRoomIdAsync(uint32_t room_id);
     awaitable<uint32_t> GetRoomIdAsync();
 
-    awaitable<void> StartReconnectGraceAsync(std::chrono::seconds timeout);
-    awaitable<void> CancelReconnectGraceAsync();
+        awaitable<uint64_t> BeginReconnectGraceAsync(std::chrono::seconds timeout);
     awaitable<bool> WaitReconnectGraceAsync();
-    
+    awaitable<void> CompleteReconnectAsync(std::shared_ptr<ChatSession> session);
+    awaitable<bool> TryExpireReconnectAsync(uint64_t generation);
 private:
 
     boost::asio::strand<boost::asio::io_context::executor_type> strand_;
@@ -41,7 +41,9 @@ private:
 
     bool is_online_;
     uint32_t room_id_;
-
-    std::weak_ptr<ChatSession> session_;
+    uint64_t reconnect_generation_;
     boost::asio::steady_timer reconnect_timer_;
+     
+    std::weak_ptr<ChatSession> session_;
+    
 };
