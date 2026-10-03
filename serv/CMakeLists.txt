@@ -71,6 +71,7 @@ add_executable(cpp_server
     src/user/UserManager.cpp
     src/room/ChatRoom.cpp
     src/room/RoomManager.cpp
+    src/room/RoomLifeCycle.cpp
     src/handler/MessageDispatcher.cpp
     src/server/ChatSession.cpp
     src/server/ChatServer.cpp
